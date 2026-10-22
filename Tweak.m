@@ -105,6 +105,12 @@
 //    所以：构造器读一次 + 设置页改动时通过 Darwin 通知推一次，其余全是 BOOL。
 
 static NSString *const NLWPrefsDomain        = @"com.liehuu.nolockwallpaper";
+/// ★ 2.0-1：**独立的总开关**。
+///   1.9-1 及以前把「禁用锁屏长按换壁纸」当成了总开关用（所有判据都带 gEnabled），
+///   于是用户关掉长按那一项，相机/手电筒也跟着全失效 —— 这是设计缺陷。
+///   现在总开关单独一项，长按那一项只管长按。
+static NSString *const NLWMasterKey          = @"MasterEnabled";
+/// 禁用锁屏长按换壁纸（**只管长按**，不再是总开关）
 static NSString *const NLWEnabledKey         = @"Enabled";
 /// 禁左滑进相机（映射 SpringBoard -lockScreenCameraSupported）
 static NSString *const NLWBlockCameraKey     = @"BlockCameraSwipe";
@@ -116,8 +122,9 @@ static NSString *const NLWBlockFlashKey      = @"BlockFlashlight";
 /// 不一致 = 改了开关没反应，且看不出原因（这类问题排查成本极高）。
 static NSString *const NLWChangedNotification = @"com.liehuu.nolockwallpaper/changed";
 
-/// 功能总开关。关闭时 hook 仍然装着，但一进判据就放行 ——
-/// 这样「关掉」是零开销的（一次 BOOL 判断），而恢复已压制的手势也能做。
+/// 总开关。关掉它 = 插件完全不动手。
+static BOOL gMasterEnabled = YES;
+/// 禁用锁屏长按换壁纸（1.0-1 就有的那一项，2.0-1 起只代表自己）。
 static BOOL gEnabled          = YES;
 /// 禁左滑进相机的子开关（用户可能只想禁长按、保留相机）。
 static BOOL gBlockCameraSwipe = YES;
@@ -148,12 +155,27 @@ static BOOL NLWReadBool(NSString *key, BOOL fallback)
 /// 键缺失时一律按「开启」：装完就该生效。
 /// 不能因为用户还没进过设置页、配置文件还没落盘，就让插件静默失效 ——
 /// 那会被当成「装坏了」，排查成本极高。
+///
+/// ★★ 2.0-1：总开关在这里做**掩码**，而不是把 gMasterEnabled 塞进每一个判据。
+///   做法：总开关关掉 → 把全部子开关压成 NO。
+///   好处：源码里所有既有判据（`if (gEnabled && ...)`、
+///   `if (gBlockCameraSwipe && ...)`）**一个字都不用改**，
+///   但语义自动变成「有效开关」——「总开关」和「子开关」不会各说各话。
+///   坏处：日志里看到的子开关值是被压过的（这正是我们想要的"生效值"）。
 static void NLWLoadSwitches(void)
 {
+    gMasterEnabled     = NLWReadBool(NLWMasterKey,     YES);
     gEnabled           = NLWReadBool(NLWEnabledKey,     YES);
     gBlockCameraSwipe  = NLWReadBool(NLWBlockCameraKey, YES);
     gBlockCameraButton = NLWReadBool(NLWBlockCamBtnKey, YES);
     gBlockFlashlight   = NLWReadBool(NLWBlockFlashKey,  YES);
+
+    if (!gMasterEnabled) {
+        gEnabled           = NO;
+        gBlockCameraSwipe  = NO;
+        gBlockCameraButton = NO;
+        gBlockFlashlight   = NO;
+    }
 }
 
 // ============================================================================
@@ -1000,9 +1022,13 @@ static NSUInteger NLWProcessView(UIView *v)
 {
     NSUInteger n = 0;
     @try {
-        // ★ 总开关放在最前面：关闭时一次 BOOL 判断就返回，零分配零开销。
-        //   两个子功能都关掉时同样是零开销。
-        if (!gEnabled) return 0;
+        // ★ ★★ 2.0-1：早退判据从 `!gEnabled` 改为「长按与相机左滑都关」。
+        //   1.9-1 这里只看 gEnabled，而 gEnabled 当时兼任总开关；
+        //   现在 gEnabled 只管长按，若仍只看它，用户在「长按关闭 + 左滑开启」
+        //   这组配置下会连左滑拦截一起被切断 —— 那是用户报的第 1 个 bug。
+        //   注意总开关不在这里判：它已经在 NLWLoadSwitches() 里把子开关掩成 NO，
+        //   所以「总开关关闭」自动等价于「两个子开关都关」，走同一条早退。
+        if (!gEnabled && !gBlockCameraSwipe) return 0;
         if (!v) return 0;
 
         // ★ 顺序很重要：先做判据、后取 gestureRecognizers。
@@ -1374,9 +1400,16 @@ static void NLWNoteCamHit(NSUInteger *counter, const char *tag)
 }
 
 /// 统一的三段式：关着就转发原实现；该禁就返回 NO；orig 丢了就放行。
+///
+/// ★★ 2.0-1：这里原本是 `off = (gEnabled && (FLAG));` —— **必须去掉 gEnabled**。
+///   1.9-1 把 gEnabled（当时代表「禁长按换壁纸」，而它同时还是唯一总开关）写进了
+///   这个宏，等于让「禁长按」替三个相机项当总开关：用户关掉长按那一项，
+///   相机按钮/左滑/手电筒三项立刻全部失效 —— 就是用户报的第 1 个 bug。
+///   现在 gEnabled 只代表长按自己，与相机三项**无任何关系**；总开关由
+///   gMasterEnabled 在 NLWLoadSwitches() 里做掩码，不进任何 hook 体。
 #define NLW_CAM_HOOK_BODY(FLAG, ORIG, TAG, COUNTER)                            \
     BOOL off = NO;                                                             \
-    @try { off = (gEnabled && (FLAG)); } @catch (NSException *e) { }            \
+    @try { off = (FLAG); } @catch (NSException *e) { }                          \
     if (!off) {                                                                \
         if (ORIG) return ((BOOL (*)(id, SEL))(ORIG))(self, _cmd);              \
         return YES;                                                            \
@@ -1392,7 +1425,20 @@ static BOOL NLWHookHasFlashlight(id self, SEL _cmd)
 
 static BOOL NLWHookHasCameraBtn(id self, SEL _cmd)
 {
-    NLW_CAM_HOOK_BODY(gBlockCameraButton, gOrigHasCameraBtn,
+    // ★★ 2.0-1 修一处自相矛盾的状态：
+    //   1.9-1 里「禁左滑」打开、「禁按钮」关闭时，按钮会显示出来，
+    //   但点它/长按它都打不开相机 —— 因为 `lockScreenCameraSupported`
+    //   返回 NO 时系统认定「本机不支持锁屏相机」，按钮的 action 走的是
+    //   同一个底层能力，自然失效。用户看到的就是「按钮在、按不动」。
+    //
+    //   ★ 为什么不能让它真的能打开：按钮可用 ⇒ lockScreenCameraSupported 必须为
+    //     YES ⇒ 系统就允许左滑进相机。这两件事在系统里是**同一个开关**，
+    //     除非去改 CoverSheet 的分页构建（私有 API、风险高、无实机验证手段），
+    //     否则「禁左滑 + 按钮可用」在 API 层面互斥。
+    //
+    //   所以这里选择让状态自洽：**只要左滑被禁，按钮就一起隐藏**。
+    //   宁可少一个按钮，也不给一个按不动的按钮。
+    NLW_CAM_HOOK_BODY((gBlockCameraButton || gBlockCameraSwipe), gOrigHasCameraBtn,
                       "camerabtn", gHintCameraBtn)
 }
 
@@ -1499,7 +1545,9 @@ static void NLWAddGestureRecognizer(id self, SEL _cmd, UIGestureRecognizer *g)
         //   不像 camera 那三个字母只可能指向相机。
         BOOL camByDesc  = NO;
         BOOL camBySwipe = NO;
-        if (gEnabled && gBlockCameraSwipe) {
+        // ★★ 2.0-1：原为 `if (gEnabled && gBlockCameraSwipe)` —— 去掉 gEnabled。
+        //   相机左滑与「禁长按换壁纸」是两条独立功能，不能互相兼任总开关。
+        if (gBlockCameraSwipe) {
             camByDesc = NLWIsCameraGestureByDescription(g);
             // ★ 只在真的是左滑时才去算宿主：NLWIsSuppressibleLockScreenArea
             //   要走 superview 链，能省就省（addGestureRecognizer 是热路径）。
@@ -1509,8 +1557,13 @@ static void NLWAddGestureRecognizer(id self, SEL _cmd, UIGestureRecognizer *g)
                               NLWIsSuppressibleLockScreenArea((UIView *)self));
             }
         }
-        if (gEnabled && (NLWIsLongPressish(g) || camByDesc || camBySwipe ||
-                         (gBlockCameraSwipe && NLWIsCameraSwipeish(g, (UIView *)self)))) {
+        // ★★ 2.0-1：拆成「长按只看 gEnabled、相机只看 gBlockCameraSwipe」。
+        //   原写法把两个开关 AND 在一起（`gEnabled && (...)`），等于要求
+        //   「禁长按」必须先开着，相机拦截才可能命中 —— 正是用户报的第 1 个 bug。
+        //   现在每一项只受自己的开关支配；总开关已在加载时掩码，不进这里。
+        if ((gEnabled && NLWIsLongPressish(g)) ||
+            camByDesc || camBySwipe ||
+            (gBlockCameraSwipe && NLWIsCameraSwipeish(g, (UIView *)self))) {
             hit = (camByDesc || camBySwipe) ? YES
                 : NLWIsSuppressibleLockScreenArea((UIView *)self);
         }
@@ -1563,7 +1616,9 @@ static void NLWSetEnabled(id self, SEL _cmd, BOOL enabled)
             const char *n = class_getName(object_getClass(self));
 
             if (NLWIsCameraEntryGestureClass(n)) {
-                if (gEnabled && gBlockCameraSwipe) {
+                // ★★ 2.0-1：原为 `if (gEnabled && gBlockCameraSwipe)`。
+                //   这里也必须去掉 gEnabled —— 相机入口只由相机那一项说了算。
+                if (gBlockCameraSwipe) {
                     block = YES;
                     NLWDiagNoteEnable(n, YES);
                 }

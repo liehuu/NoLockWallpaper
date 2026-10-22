@@ -145,8 +145,12 @@ done
 grep -aq "MSHookMessageEx" "$BUILD/NoLockWallpaper.dylib" \
   || { echo "✗ dylib 缺 MSHookMessageEx 字符串（装配路径会退回自实现）"; exit 1; }
 
-# 设置页开关读取指纹：配置域名与两个键名
-for sym in com.liehuu.nolockwallpaper Enabled BlockCameraSwipe \
+# 设置页开关读取指纹：配置域名与全部键名
+# ★ 2.0-1：加入 MasterEnabled（总开关）、BlockCameraButton、BlockFlashlight。
+#   漏掉 MasterEnabled ⇒ 「总开关没编进去」不会被发现，表现为拨了没反应；
+#   另两个是 1.9-1 就有的键，之前没进指纹，属于漏检，一并补上。
+for sym in com.liehuu.nolockwallpaper MasterEnabled Enabled BlockCameraSwipe \
+           BlockCameraButton BlockFlashlight \
            com.liehuu.nolockwallpaper/changed; do
   grep -aq "$sym" "$BUILD/NoLockWallpaper.dylib" \
     || { echo "✗ dylib 缺 ${sym}（开关会失效）"; exit 1; }

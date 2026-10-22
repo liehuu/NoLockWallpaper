@@ -76,7 +76,25 @@ env:
   #   并且按用户要求拆成三个独立开关：
   #     BlockFlashlight → hasFlashlight / BlockCameraButton → hasCamera /
   #     BlockCameraSwipe → lockScreenCameraSupported
-  VERSION: 1.9-1
+  # ★ 2.0-1：**第七次修复，修上一版自己引入的两个缺陷**。
+  #   1.9-1 实测生效（三个 hook 方向正确），但暴露出两个设计问题：
+  #   ① 「禁用锁屏长按换壁纸」被做成了事实上的总开关：
+  #      gEnabled 出现在 NLW_CAM_HOOK_BODY 宏里和所有手势判据里，
+  #      用户关掉长按那一项，相机/手电筒三项立刻全部失效。
+  #      修法：新增独立总开关 MasterEnabled，在 NLWLoadSwitches() 里
+  #      做**掩码**（总开关关 → 把四个子开关全压成 NO），
+  #      所有既有判据一个字都不用改，语义自动变正确；
+  #      同时把 gEnabled 从相机 hook 宏和手势判据里彻底摘掉。
+  #   ② 「禁用锁屏相机按钮」关闭后按钮出现了，但长按打不开相机。
+  #      根因：hasCamera（按钮显示）与 lockScreenCameraSupported（相机能力）
+  #      在系统层面是同一个开关 —— 后者返回 NO 时系统认定本机不支持
+  #      锁屏相机，按钮的 action 也一起失效。
+  #      修法：让状态自洽 —— 只要左滑被禁，按钮就一起隐藏
+  #      （(gBlockCameraButton || gBlockCameraSwipe)），
+  #      宁可少一个按钮，也不给一个按不动的按钮。
+  #      已经查证（Apple 官方文档 + 多个资料源）：系统不存在「只禁左滑
+  #      而保留相机按钮」的开关，越狱插件层面同样是一刀切。
+  VERSION: 2.0-1
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 

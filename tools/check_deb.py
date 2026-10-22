@@ -589,8 +589,12 @@ def check_deb(path):
         nm = dl[0][0]
         tf = tarfile.open(fileobj=io.BytesIO(data_tar), mode="r:")
         body = tf.extractfile(tf.getmember(nm)).read()
-        for needle in (b"com.liehuu.nolockwallpaper", b"Enabled",
-                       b"BlockCameraSwipe",
+        for needle in (b"com.liehuu.nolockwallpaper",
+                       # ★ 2.0-1：总开关 + 两个相机子开关的键名。
+                       #   漏掉 MasterEnabled ⇒「总开关没编进产物」不会被发现。
+                       b"MasterEnabled", b"Enabled",
+                       b"BlockCameraSwipe", b"BlockCameraButton",
+                       b"BlockFlashlight",
                        b"com.liehuu.nolockwallpaper/changed",
                        b"UIScreenEdgePanGestureRecognizer", b"edges",
                        # ★ 1.9-1：三个 bool getter 一个都不能少。

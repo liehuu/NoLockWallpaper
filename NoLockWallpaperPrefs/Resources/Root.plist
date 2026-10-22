@@ -8,18 +8,51 @@
 	<array>
 
 		<!-- ============================================================
+		     组 0：总开关（2.0-1 新增）
+		     ★ 为什么单独一组：1.9-1 及以前「禁用锁屏长按换壁纸」被当成了
+		       事实上的总开关（源码里所有判据都带 gEnabled），用户关掉它，
+		       后面的相机/手电筒三项一起失效。这是设计缺陷。
+		       现在总开关独立成项，与任何具体功能都不共用。
+		     ============================================================ -->
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>总开关</string>
+			<key>footerText</key>
+			<string>关掉这一项，下面所有开关都不再生效（插件完全不动手），下面各项的开关状态会被保留，重新打开总开关即恢复。</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>启用 NoLockWallpaper</string>
+			<key>defaults</key>
+			<string>com.liehuu.nolockwallpaper</string>
+			<key>key</key>
+			<string>MasterEnabled</string>
+			<key>default</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.liehuu.nolockwallpaper/changed</string>
+		</dict>
+
+		<!-- ============================================================
 		     组 1：功能开关
 		     ★ defaults 必须与 Tweak.m 的 NLWPrefsDomain 完全一致，
 		       否则开关写到一个域、插件读另一个域 → 开关完全无效。
 		     ★ key 必须与 Tweak.m 的 NLWEnabledKey / NLWBlockCameraKey 一致。
 		     ★ PostNotification 必须与 Tweak.m 的 NLWChangedNotification 一致
 		       （插件靠它做「关掉即时生效」）。
+		     ★ 2.0-1：「禁用锁屏长按换壁纸」只代表长按自己，
+		       不再是总开关（总开关见上面组 0）。
 		     ============================================================ -->
 		<dict>
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>功能</string>
+			<string>功能（四项互不影响）</string>
 		</dict>
 
 		<dict>
@@ -86,9 +119,9 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>关于上面三项</string>
+			<string>关于上面四项</string>
 			<key>footerText</key>
-			<string>「锁屏手电筒」和「锁屏相机按钮」互不影响。&#10;「左滑进相机」这一项是系统级的开关（告诉系统本机不支持锁屏相机），打开时相机按钮一定跟着消失，无法只禁左滑而保留按钮 —— 这是同一个系统开关，不是本插件的取舍。</string>
+			<string>四项各自独立，关掉哪一项只影响哪一项。&#10;&#10;唯一的例外是「左滑进相机」：它是系统级开关（告诉系统本机不支持锁屏相机），一旦打开，相机按钮即使不被禁用也无法使用。所以这一项打开时相机按钮会一起隐藏 —— 与其给一个按不动的按钮，不如不给。想只用按钮、不用左滑，请把「左滑」关掉再打开「相机按钮」。</string>
 		</dict>
 
 		<!-- ============================================================

@@ -403,7 +403,8 @@ CASES = [
     ),
     (
         "★ 相机按钮 hook 错用了手电筒的开关（拨一个动两个）",
-        "    NLW_CAM_HOOK_BODY(gBlockCameraButton, gOrigHasCameraBtn,",
+        "    NLW_CAM_HOOK_BODY((gBlockCameraButton || gBlockCameraSwipe), "
+        "gOrigHasCameraBtn,",
         "    NLW_CAM_HOOK_BODY(gBlockFlashlight, gOrigHasCameraBtn,",
         "三个 hook 体分别引用自己的 orig 与自己的开关",
     ),
@@ -462,6 +463,82 @@ CASES = [
         "static void NLWInstallCameraTriple(void)",
         "旧的两套相机安装函数已彻底移除",
     ),
+    # ------------------------------------------------------------------
+    # 2.0-1：独立总开关 + 相机按钮与左滑的状态自洽
+    # ★★ 这一组守的是 1.9-1 **自己引入**的两个缺陷（用户实机反馈）：
+    #    ① 长按开关兼任总开关 → 关掉长按，相机三项一起废；
+    #    ② 禁左滑时按钮显示出来但按不动。
+    #    两个都是「功能看起来还在、其实废了」的形态，不报错、不崩溃，
+    #    只能靠判据守。
+    # ------------------------------------------------------------------
+    (
+        "★★ 总开关不掩码（关掉总开关，子开关照旧生效 = 总开关是假的）",
+        "    if (!gMasterEnabled) {",
+        "    if (NO) {",
+        "总开关关掉时把四个子开关全部掩成 NO",
+    ),
+    (
+        "★★ 总开关掩码漏掉一项（那一项不受总开关管）",
+        "        gBlockFlashlight   = NO;",
+        "        gBlockFlashlight   = gBlockFlashlight;",
+        "总开关关掉时把四个子开关全部掩成 NO",
+    ),
+    (
+        "★★ 相机 hook 宏里写回 gEnabled（长按开关兼任总开关，用户报的第 1 个 bug）",
+        "off = (FLAG);",
+        "off = (gEnabled && (FLAG));",
+        "相机 hook 宏里不含 gEnabled",
+    ),
+    (
+        "★★ hasCamera 只看按钮开关（禁左滑时会出现一个按不动的按钮）",
+        "    NLW_CAM_HOOK_BODY((gBlockCameraButton || gBlockCameraSwipe), "
+        "gOrigHasCameraBtn,",
+        "    NLW_CAM_HOOK_BODY(gBlockCameraButton, gOrigHasCameraBtn,",
+        "hasCamera 同时看 gBlockCameraButton 与 gBlockCameraSwipe",
+    ),
+    (
+        "★★ 手势层早退只看 gEnabled（长按关掉后左滑拦截一起失效）",
+        "        if (!gEnabled && !gBlockCameraSwipe) return 0;",
+        "        if (!gEnabled) return 0;",
+        "NLWProcessView 的早退不是只看 gEnabled",
+    ),
+    (
+        "★★ 手势判据把长按与相机左滑 AND 在一起（用户报的第 1 个 bug）",
+        "        if (gBlockCameraSwipe) {\n"
+        "            camByDesc = NLWIsCameraGestureByDescription(g);",
+        "        if (gEnabled && gBlockCameraSwipe) {\n"
+        "            camByDesc = NLWIsCameraGestureByDescription(g);",
+        "手势判据里没有 gEnabled && gBlockCameraSwipe",
+    ),
+    (
+        "★★ 总开关散进 hook 体（掩码之外再判一次 = 两套语义）",
+        "static BOOL NLWHookHasFlashlight(id self, SEL _cmd)\n"
+        "{\n"
+        "    NLW_CAM_HOOK_BODY(gBlockFlashlight, gOrigHasFlashlight,",
+        "static BOOL NLWHookHasFlashlight(id self, SEL _cmd)\n"
+        "{\n"
+        "    if (!gMasterEnabled) return YES;\n"
+        "    NLW_CAM_HOOK_BODY(gBlockFlashlight, gOrigHasFlashlight,",
+        "总开关不进任何 hook 体",
+    ),
+    (
+        "★★ 总开关键名与 Root.plist 不一致（设置页那一项拨了没反应）",
+        'static NSString *const NLWMasterKey          = @"MasterEnabled";',
+        'static NSString *const NLWMasterKey          = @"MasterEnabledX";',
+        "Root.plist 含总开关项",
+    ),
+    (
+        "★ 总开关变量缺失（设置页那一项拨了没反应）",
+        "static BOOL gMasterEnabled = YES;",
+        "static BOOL gMasterEnabledX = YES;",
+        "有总开关变量 gMasterEnabled",
+    ),
+    (
+        "★ 总开关键缺失（只能继续借用 Enabled）",
+        'static NSString *const NLWMasterKey          = @"MasterEnabled";',
+        'static NSString *const NLWMasterKeyGone      = @"MasterEnabled";',
+        "有独立的总开关键 NLWMasterKey",
+    ),
 ]
 
 # ★ B 组：构建闸门本身的判据写错（真实误报过一次，潜伏三个 run 才暴露）
@@ -495,9 +572,18 @@ BUILD_CASES = [
     ),
     (
         "指纹列表漏掉 BlockCameraSwipe（相机子开关失效不会被发现）",
-        "for sym in com.liehuu.nolockwallpaper Enabled BlockCameraSwipe \\",
-        "for sym in com.liehuu.nolockwallpaper Enabled \\",
-        "指纹列表覆盖配置域名与两个开关键",
+        "com.liehuu.nolockwallpaper MasterEnabled Enabled BlockCameraSwipe \\",
+        "com.liehuu.nolockwallpaper MasterEnabled Enabled \\",
+        "指纹列表覆盖配置域名与全部开关键",
+    ),
+    (
+        # ★ 2.0-1：总开关是这一版的核心新增项。指纹里漏掉它，等于
+        #   「总开关没编进产物」永远不会被发现 —— 而它的失效表现恰好是
+        #   「拨了没反应」，和「没实现」一模一样，最容易被误判成玄学。
+        "★ 指纹列表漏掉 MasterEnabled（总开关失效不会被发现）",
+        "com.liehuu.nolockwallpaper MasterEnabled Enabled BlockCameraSwipe \\",
+        "com.liehuu.nolockwallpaper Enabled BlockCameraSwipe \\",
+        "指纹列表覆盖配置域名与全部开关键",
     ),
     (
         # 枚举常量编译后是立即数，产物里没有字符串 → 闸门必然误报

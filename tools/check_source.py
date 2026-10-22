@@ -695,17 +695,22 @@ chk("三个 orig 各自独立（共用会转发到另一张方法表的原实现
     "orig 变量不全 → 有 hook 无法转发或转发错")
 
 chk("三个 hook 体分别引用自己的 orig 与自己的开关",
+    # ★ 2.0-1 起 hasCamera 的开关是 `(gBlockCameraButton || gBlockCameraSwipe)`：
+    #   按钮「显示」本身受左滑牵连，因为系统层面两者共用同一个能力开关
+    #   （lockScreenCameraSupported 为 NO 时按钮按不动）。所以这里期望的是
+    #   这个二元表达式，而不是单个 gBlockCameraButton。
     re.search(r"NLW_CAM_HOOK_BODY\(gBlockFlashlight,\s*gOrigHasFlashlight",
               code) is not None and
-    re.search(r"NLW_CAM_HOOK_BODY\(gBlockCameraButton,\s*gOrigHasCameraBtn",
-              code) is not None and
+    re.search(r"NLW_CAM_HOOK_BODY\(\(\s*gBlockCameraButton\s*\|\|\s*"
+              r"gBlockCameraSwipe\s*\),\s*gOrigHasCameraBtn", code) is not None and
     re.search(r"NLW_CAM_HOOK_BODY\(gBlockCameraSwipe,\s*gOrigLSCamInst2",
               code) is not None and
     re.search(r"NLW_CAM_HOOK_BODY\(gBlockCameraSwipe,\s*gOrigLSCamMeta2",
               code) is not None,
     "" if all(re.search(p, code) for p in (
         r"NLW_CAM_HOOK_BODY\(gBlockFlashlight,\s*gOrigHasFlashlight",
-        r"NLW_CAM_HOOK_BODY\(gBlockCameraButton,\s*gOrigHasCameraBtn",
+        r"NLW_CAM_HOOK_BODY\(\(\s*gBlockCameraButton\s*\|\|\s*"
+        r"gBlockCameraSwipe\s*\),\s*gOrigHasCameraBtn",
         r"NLW_CAM_HOOK_BODY\(gBlockCameraSwipe,\s*gOrigLSCamInst2",
         r"NLW_CAM_HOOK_BODY\(gBlockCameraSwipe,\s*gOrigLSCamMeta2")) else
     "hook 体没各用各的开关/orig → 拨一个开关动三个功能，或转发错实现")
@@ -741,12 +746,23 @@ chk("三个开关变量都有定义",
     "开关变量缺失 → 设置页那一项拨了没反应")
 
 _load = _body_of(r"static void NLWLoadSwitches\(void\)")
-chk("NLWLoadSwitches 真的读了三个相机开关",
-    "gBlockCameraSwipe" in _load and "gBlockCameraButton" in _load and
-    "gBlockFlashlight" in _load,
-    "" if ("gBlockCameraSwipe" in _load and "gBlockCameraButton" in _load and
-           "gBlockFlashlight" in _load) else
-    "新开关没被读取 → 永远是默认值，拨了没用")
+# ★★ 判据必须查「读取形态」，不能只查变量名出现过。
+#   2.0-1 加了总开关掩码块，块里也有 `gBlockFlashlight = NO;` ——
+#   如果只判 `"gBlockFlashlight" in _load`，那么把读取行整行删掉，
+#   掩码块里的赋值仍会让判据通过，反向验证会报「漏放」。
+#   （这就是「用 in 判代码还在不在」的老坑，第三次踩到。）
+_load_pairs = (("gBlockCameraSwipe", "NLWBlockCameraKey"),
+               ("gBlockCameraButton", "NLWBlockCamBtnKey"),
+               ("gBlockFlashlight", "NLWBlockFlashKey"))
+_load_missing = [v for v, k in _load_pairs
+                 if re.search(r"%s\s*=\s*NLWReadBool\(\s*%s" % (v, k),
+                              _load) is None]
+chk("NLWLoadSwitches 真的读了三个相机开关（查读取形态，不查名字）",
+    bool(_load) and not _load_missing,
+    "" if (bool(_load) and not _load_missing) else
+    ("取不到 NLWLoadSwitches 函数体" if not _load
+     else "没有从配置读取：%s → 永远是默认值，拨了没用"
+          % ", ".join(_load_missing)))
 
 chk("在 NLWInit 里真正调用了装配函数",
     re.search(r"^\s*NLWInstallCameraTriple\(\s*\);", code, re.M) is not None,
@@ -759,6 +775,103 @@ chk("旧的两套相机安装函数已彻底移除（避免重复 hook 同一方
     "" if ("NLWInstallHasCameraHook" not in code and
            "NLWInstallLSCamHook" not in code) else
     "旧安装函数还在 → 可能与新实现重复 hook 同一方法")
+
+
+# =====================================================================
+print("\n[A4n] 2.0-1：独立总开关（掩码式）+ 相机按钮与左滑的状态自洽")
+# ★★★ 这一组修的是 1.9-1 **自己引入**的两个缺陷（用户实机反馈）：
+#   ① 「禁用锁屏长按换壁纸」被做成了事实上的总开关 ——
+#      gEnabled 写进了 NLW_CAM_HOOK_BODY 宏，也写在所有手势判据里；
+#      用户关掉长按那一项，相机/手电筒三项立刻全部失效。
+#   ② 「禁用锁屏相机按钮」关闭后按钮重现，但长按打不开相机 ——
+#      lockScreenCameraSupported 返回 NO 时系统认定本机不支持锁屏相机，
+#      按钮的 action 走同一底层能力，一起失效。
+#
+# ★ ① 的修法是**掩码**而不是「逐处判断」：
+#   总开关关掉 → 在 NLWLoadSwitches() 里把四个子开关压成 NO，
+#   于是所有既有判据一个字都不用改，语义自动变成「有效开关」。
+#   这样也就不存在「总开关散落在二十个 if 里，漏改一处就是漏洞」。
+# ★ ② 的修法是让状态自洽：左滑被禁时按钮一起隐藏 ——
+#   不给用户一个按不动的按钮（系统层面两者本就是同一个开关）。
+
+m_master = re.search(r'NLWMasterKey\s*=\s*@"([^"]+)"', src)
+chk("有独立的总开关键 NLWMasterKey", m_master is not None,
+    "" if m_master else "总开关没有自己的键 → 只能继续借用 Enabled")
+chk("有总开关变量 gMasterEnabled",
+    re.search(r"static BOOL gMasterEnabled\s*=\s*YES", code) is not None,
+    "" if re.search(r"static BOOL gMasterEnabled\s*=\s*YES", code) else
+    "总开关变量缺失 → 设置页那一项拨了没反应")
+
+_load2 = _body_of(r"static void NLWLoadSwitches\(void\)")
+# 取 `if (!gMasterEnabled) { ... }` 这一整块，确认掩码写在块内。
+_mask_block = ""
+_mb = re.search(r"if\s*\(\s*!gMasterEnabled\s*\)\s*\{", _load2)
+if _mb:
+    _d, _i, _s = 0, _mb.end() - 1, _mb.end() - 1
+    while _i < len(_load2):
+        if _load2[_i] == "{":
+            _d += 1
+        elif _load2[_i] == "}":
+            _d -= 1
+            if _d == 0:
+                _mask_block = _load2[_s:_i + 1]
+                break
+        _i += 1
+
+_mask_vars = ("gEnabled", "gBlockCameraSwipe", "gBlockCameraButton",
+              "gBlockFlashlight")
+_mask_missing = [v for v in _mask_vars
+                 if re.search(r"\b%s\s*=\s*NO\s*;" % v, _mask_block) is None]
+chk("总开关关掉时把四个子开关全部掩成 NO（掩码式总开关）",
+    bool(_mask_block) and not _mask_missing,
+    "" if (bool(_mask_block) and not _mask_missing) else
+    ("没有 if (!gMasterEnabled) 掩码块" if not _mask_block
+     else "掩码块里缺少：%s" % ", ".join(_mask_missing)))
+
+# ★ 宏里绝不能出现 gEnabled —— 这一处就是「长按兼任总开关」的根源。
+_m_macro = re.search(r"#define NLW_CAM_HOOK_BODY.*?return NO;", code, re.S)
+_macro_body = _m_macro.group(0) if _m_macro else ""
+chk("★ 相机 hook 宏里不含 gEnabled（长按开关不得兼任总开关）",
+    bool(_macro_body) and "gEnabled" not in _macro_body,
+    "" if (bool(_macro_body) and "gEnabled" not in _macro_body) else
+    ("取不到宏定义 → 判据无效" if not _macro_body
+     else "宏里仍写着 gEnabled → 关掉长按会把相机三项一起关掉"))
+
+# ★ 手势层同理：不允许把「长按」和「相机左滑」AND 在一起。
+chk("★ 手势判据里没有 gEnabled && gBlockCameraSwipe",
+    re.search(r"gEnabled\s*&&\s*gBlockCameraSwipe", code) is None,
+    "" if re.search(r"gEnabled\s*&&\s*gBlockCameraSwipe", code) is None else
+    "长按开关仍与左滑开关 AND → 长按关掉后左滑拦截一起失效")
+chk("★ NLWProcessView 的早退不是只看 gEnabled",
+    re.search(r"if\s*\(\s*!gEnabled\s*\)\s*return 0\s*;", code) is None,
+    "" if re.search(r"if\s*\(\s*!gEnabled\s*\)\s*return 0\s*;", code) is None
+    else "只看 gEnabled 就早退 → 长按关掉后手势层整体不工作")
+
+# ★ 总开关只允许出现在 NLWLoadSwitches 里（掩码），不许散进 hook 体。
+_gn_hits = []
+for _fn in ("NLWHookHasFlashlight", "NLWHookHasCameraBtn",
+            "NLWHookLSCamInst", "NLWHookLSCamMeta"):
+    _b = _body_of(r"static BOOL %s\(" % _fn)
+    if "gMasterEnabled" in _b:
+        _gn_hits.append(_fn)
+chk("总开关不进任何 hook 体（只有掩码一处，不散落）", not _gn_hits,
+    "这些 hook 体里出现了 gMasterEnabled：%s" % ", ".join(_gn_hits)
+    if _gn_hits else "")
+
+_hascam = _body_of(r"static BOOL NLWHookHasCameraBtn\(")
+chk("★ hasCamera 同时看 gBlockCameraButton 与 gBlockCameraSwipe",
+    "gBlockCameraButton" in _hascam and "gBlockCameraSwipe" in _hascam,
+    "" if ("gBlockCameraButton" in _hascam and "gBlockCameraSwipe" in _hascam)
+    else "只看按钮开关 → 禁左滑时仍会显示一个按不动的相机按钮")
+
+_rootpl2 = os.path.join(_REPO, "NoLockWallpaperPrefs", "Resources", "Root.plist")
+if os.path.isfile(_rootpl2) and m_master:
+    _rp2 = open(_rootpl2, encoding="utf-8").read()
+    _mk = m_master.group(1)
+    chk("Root.plist 含总开关项 %r" % _mk,
+        ("<string>%s</string>" % _mk) in _rp2,
+        "" if ("<string>%s</string>" % _mk) in _rp2 else
+        "设置页没有总开关项 → 用户看不到也拨不到")
 
 
 # =====================================================================
@@ -1181,9 +1294,17 @@ chk("没有「压掉所有 pan」的粗暴写法",
     re.search(r"NLWIsPanish\(g\)\s*\)\s*\{\s*NLWSuppressGesture", code) is None,
     "" if re.search(r"NLWIsPanish\(g\)\s*\)\s*\{\s*NLWSuppressGesture", code) is None
     else "会连上滑解锁一起废掉")
-chk("总开关在判据最前面（关闭时零开销放行）",
-    re.search(r"if\s*\(!gEnabled\)\s*return\s+0;", code) is not None,
-    "" if re.search(r"if\s*\(!gEnabled\)\s*return\s+0;", code) else "关闭时仍在做判据")
+chk("手势层早退判据是「长按与左滑都关」（不是只看 gEnabled）",
+    # ★★ 2.0-1 改：原来这里要求 `if (!gEnabled) return 0;`。
+    #   但 2.0-1 起 gEnabled 只代表「禁长按」，若仍只看它，
+    #   用户在「长按关闭 + 左滑开启」这组配置下会连左滑拦截一起被切断。
+    #   总开关不在这里判 —— 它已在 NLWLoadSwitches() 里把子开关掩成 NO，
+    #   「总开关关闭」自动等价于「两个子开关都关」，走同一条早退。
+    re.search(r"if\s*\(\s*!gEnabled\s*&&\s*!gBlockCameraSwipe\s*\)\s*return\s+0\s*;",
+              code) is not None,
+    "" if re.search(r"if\s*\(\s*!gEnabled\s*&&\s*!gBlockCameraSwipe\s*\)\s*"
+                    r"return\s+0\s*;", code) else
+    "早退判据不对 → 要么关长按连带关掉左滑拦截，要么关闭时仍在做判据")
 
 # =====================================================================
 print("\n[A8] killswitch（出问题不用卸载）")
@@ -1557,9 +1678,12 @@ chk("指纹列表覆盖 edge pan 判据",
     "UIScreenEdgePanGestureRecognizer" in _fp_block and "edges" in _fp_block,
     "实际：%s" % _fp_block,
     )
-chk("指纹列表覆盖配置域名与两个开关键",
+chk("指纹列表覆盖配置域名与全部开关键",
+    # ★ 2.0-1：补齐 MasterEnabled / BlockCameraButton / BlockFlashlight。
+    #   漏掉总开关 = 「总开关没编进去」永远发现不了，表现为拨了没反应。
     all(x in _fp_block for x in
-        ["com.liehuu.nolockwallpaper", "Enabled", "BlockCameraSwipe"]),
+        ["com.liehuu.nolockwallpaper", "MasterEnabled", "Enabled",
+         "BlockCameraSwipe", "BlockCameraButton", "BlockFlashlight"]),
     "实际：%s" % _fp_block)
 
 # ★★★ 对产物做字符串指纹时，禁止使用「编译后不存在的名字」。
