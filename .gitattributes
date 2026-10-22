@@ -1,0 +1,22 @@
+# 这些文件在 Linux/macOS runner 上直接被执行或解释，CRLF 会导致
+# `line 2: : command not found`（sh）或 perl 语法异常。
+# ★ 注意：本文件只在 **git 通道** 生效；用 REST API 直推 blob 不会做规范化。
+#   所以 tools/check_source.py 的 A13 会独立复查磁盘上的真实行尾。
+*.x text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.plist text eol=lf
+*.sh text eol=lf
+*.pl text eol=lf
+*.pm text eol=lf
+*.md text eol=lf
+
+# 二进制资源不做换行转换
+*.png binary
+*.jpg binary
+*.deb binary
+*.m text eol=lf
+*.h text eol=lf
+*.sh text eol=lf
+*.properties text eol=lf
