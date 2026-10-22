@@ -28,6 +28,11 @@ BUILD = os.environ.get("NLW_BUILD_OVERRIDE") or os.path.join(_REPO, "devkit", "b
 # ★ 同上：设置页控制器的反向验证需要替换这份源码。
 PREFM_OVERRIDE = os.environ.get("NLW_PREF_OVERRIDE")
 MKDEB = os.environ.get("NLW_MKDEB_OVERRIDE") or os.path.join(_REPO, "devkit", "mkdeb.sh")
+# ★ check_deb.py 跑在真实产物上。这里也要静态复查它的判据有没有用
+#   「编译后会消失的名字」（枚举常量 / 宏 / 内联函数）做字符串匹配 ——
+#   那是注定 FAIL 的假判据（本轮实测 UIRectEdgeRight）。
+CHECKDEB = os.environ.get("NLW_CHECKDEB_OVERRIDE") or os.path.join(_REPO, "tools",
+                                                                  "check_deb.py")
 PLIST = os.path.join(_REPO, "NoLockWallpaper.plist")
 
 fails, oks = [], []
@@ -1025,6 +1030,48 @@ chk("指纹列表覆盖配置域名与两个开关键",
     all(x in _fp_block for x in
         ["com.liehuu.nolockwallpaper", "Enabled", "BlockCameraSwipe"]),
     "实际：%s" % _fp_block)
+
+# ★★★ 对产物做字符串指纹时，禁止使用「编译后不存在的名字」。
+#   真实翻车（本轮 check_deb.py，产物校验）：
+#     UIRectEdgeRight 是枚举常量（值 8），编译后是 `and w8, w0, #8`
+#     这类指令里的立即数 —— 二进制里**一个字节都不剩**。
+#     判据查它 → 在真实产物上必然 FAIL，而产物其实完全正确。
+#   同类会消失的名字：
+#     · 枚举常量（UIRectEdgeRight / NSTextAlignmentCenter ...）
+#     · #define 宏（宏在预处理期就被替换掉）
+#     · static const（会被内联或消除）
+#     · C 内联函数名
+#   反过来，**会留下字符串**的是：
+#     · selector 名（@selector(...) / 点语法调用的方法名）
+#     · 类名（objc_getClass / isKindOfClass 用的字符串）
+#     · 字符串字面量（CFPreferences 域名、键名、通知名）
+#   所以：产物指纹一律只用后三类。前一类靠源码层判据保证。
+_DEAD_FP = ["UIRectEdgeRight", "UIRectEdgeLeft", "UIRectEdgeTop",
+            "UIRectEdgeBottom", "UIRectEdgeAll", "UIRectEdgeNone"]
+_dup = [x for x in _DEAD_FP if x in _fp_block]
+chk("指纹列表不含编译后会消失的枚举常量",
+    not _dup,
+    "实际含：%s —— 枚举值是立即数，产物里没有字符串 → 闸门必然误报" % _dup
+    if _dup else "")
+# check_deb.py 是真正跑在产物上的校验，同样不能查枚举
+# ★★ 必须查**原始源码**，不能用 strip_code：strip_code 会把字符串字面量
+#   的内容一起换成空格，而这里要找的 `b"UIRectEdgeRight"` 本身就是字符串字面量
+#   —— 用 _cd_code 查永远匹配不到，判据 100% 假绿（反向验证 E1 实测漏放）。
+#   本项目已犯过同源错误：判据含字符串字面量时必须查原始 src。
+if os.path.isfile(CHECKDEB):
+    _cd_raw = open(CHECKDEB, encoding="utf-8").read()
+    # ★ 这里**必须**查原始文本 _cd_raw，不能查 strip_code 结果：
+    #   要找的 `b"UIRectEdgeRight"` 本身就是字符串字面量，
+    #   strip_code 会把字面量内容换成空格 → 永远匹配不到 → 判据 100% 假绿。
+    #   （反向验证 E1 实测漏放，本项目同源错误已第 N 次出现。）
+    #   代价是注释里提到枚举名也会命中 —— 但这方向是「宁可误报」：
+    #   注释里写 `b"UIRectEdgeRight"` 这种形态本来就极罕见，
+    #   而漏放的后果是产物校验脚本带着死判据上线。
+    _dup2 = [x for x in _DEAD_FP if ('b"%s"' % x) in _cd_raw]
+    chk("check_deb.py 不用枚举常量做产物指纹",
+        not _dup2,
+        "实际含：%s —— 该名字编译后不存在，判据必然 FAIL" % _dup2
+        if _dup2 else "")
 
 # 设置页产物必须单独过指纹闸门（主 dylib 的闸门管不到它）
 chk("build.sh 有设置页产物的指纹闸门",

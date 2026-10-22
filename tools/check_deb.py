@@ -525,8 +525,20 @@ def check_deb(path):
         for needle in (b"com.liehuu.nolockwallpaper", b"Enabled",
                        b"BlockCameraSwipe",
                        b"com.liehuu.nolockwallpaper/changed",
-                       b"UIScreenEdgePanGestureRecognizer", b"UIRectEdgeRight"):
+                       b"UIScreenEdgePanGestureRecognizer", b"edges"):
             chk("主 dylib 含开关/相机指纹 %s" % needle.decode(), needle in body)
+        # ★★ 绝不在这里查 UIRectEdgeRight —— 它是**枚举常量**，值是 8，
+        #   编译后是 `and w8, w0, #8` 这类指令里的立即数，
+        #   二进制里**不会留下任何字符串**。第一版判据查了它，
+        #   在真实产物上必然 FAIL（本轮实测：dylib 里 UIRectEdgeRight=False，
+        #   而 edges=True / EdgePan=True / ScreenEdge=True）。
+        #   源码层面「真的用了右边缘限定」由 check_source.py 的 A7d 保证；
+        #   产物层面只能验证「调用了 edges」这个 selector，两者合起来才完整。
+        #   通用规律：**枚举值 / #define 常量 / 内联函数名都不会进二进制**，
+        #   对产物做字符串判据时必须先自问「这个名字在编译后还存在吗」。
+        for extra in (b"EdgePan", b"ScreenEdge"):
+            chk("主 dylib 含类名兜底指纹 %s" % extra.decode(), extra in body,
+                "" if extra in body else "自定义边缘手势类的兜底判据失效")
         # 日志已整体移除（用户要求）
         chk("主 dylib 不含日志路径 NoLockWallpaper/nlw.log",
             b"/Logs/NoLockWallpaper" not in body,

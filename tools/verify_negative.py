@@ -25,6 +25,7 @@ BUILD_SH = os.path.join(ROOT, "devkit", "build.sh")
 MKDEB_SH = os.path.join(ROOT, "devkit", "mkdeb.sh")
 PREF_M = os.path.join(ROOT, "NoLockWallpaperPrefs",
                       "NoLockWallpaperRootListController.m")
+CHECK_DEB = os.path.join(HERE, "check_deb.py")
 CHK = os.path.join(HERE, "check_source.py")
 
 PY = sys.executable
@@ -73,6 +74,16 @@ def _write(tmpdir, filename, text):
 def run_check_mkdeb(mutated_text):
     """用替换过的 mkdeb.sh 跑自检（设置页载荷类判据）。"""
     return _run_with_override("NLW_MKDEB_OVERRIDE", "mkdeb.sh", mutated_text)
+
+
+def run_check_checkdeb(mutated_text):
+    """用替换过的 check_deb.py 跑自检（产物指纹维度类判据）。
+
+    ★ 这一组防的是「产物校验脚本自己写错」—— 它跑在真实 deb 上，
+      写错时要么永远 FAIL（误杀正确产物），要么永远 PASS（假绿）。
+      两种都只能靠反向验证发现。
+    """
+    return _run_with_override("NLW_CHECKDEB_OVERRIDE", "check_deb.py", mutated_text)
 
 
 def _run_with_override(env_key, filename, mutated_text):
@@ -235,6 +246,13 @@ BUILD_CASES = [
         "指纹列表覆盖配置域名与两个开关键",
     ),
     (
+        # 枚举常量编译后是立即数，产物里没有字符串 → 闸门必然误报
+        "指纹列表用枚举常量 UIRectEdgeRight（产物里根本没有此字符串）",
+        "for sym in UIScreenEdgePanGestureRecognizer edges Camera; do",
+        "for sym in UIScreenEdgePanGestureRecognizer edges Camera UIRectEdgeRight; do",
+        "指纹列表不含编译后会消失的枚举常量",
+    ),
+    (
         "设置页产物不做架构校验（装了设置页白屏也发现不了）",
         'xcrun lipo -info "$PREF_OUT/NoLockWallpaperPrefs" | grep -q "$CPU"',
         'echo skip',
@@ -368,6 +386,19 @@ MKDEB_CASES = [
 ]
 
 
+CHECKDEB_CASES = [
+    (
+        # ★ 本轮真实翻车原样复现：UIRectEdgeRight 是枚举值 8，
+        #   产物里一个字节都没有 → 判据必然 FAIL，而产物完全正确。
+        "用枚举常量做产物指纹（该名字编译后不存在，判据必然误杀）",
+        'b"UIScreenEdgePanGestureRecognizer", b"edges"):',
+        'b"UIScreenEdgePanGestureRecognizer", b"edges",\n'
+        '                       b"UIRectEdgeRight"):',
+        "check_deb.py 不用枚举常量做产物指纹",
+    ),
+]
+
+
 def _run_group(label, cases, orig_text, runner, tmpdir, fails):
     """跑一组「原地替换源码 → 期望自检 FAIL」的用例。返回本组用例数。"""
     n = 0
@@ -405,6 +436,7 @@ def main():
     build_sh_orig = io.open(BUILD_SH, encoding="utf-8").read()
     pref_m_orig = io.open(PREF_M, encoding="utf-8").read()
     mkdeb_orig = io.open(MKDEB_SH, encoding="utf-8").read()
+    checkdeb_orig = io.open(CHECK_DEB, encoding="utf-8").read()
 
     ok, out = run_check(SRC)
     print("=" * 70)
@@ -438,6 +470,9 @@ def main():
         # ---------- D 组：改 mkdeb.sh ----------
         total += _run_group("D", MKDEB_CASES, mkdeb_orig,
                             run_check_mkdeb, tmpdir, fails)
+        # ---------- E 组：改 check_deb.py（产物校验脚本自己写错） ----------
+        total += _run_group("E", CHECKDEB_CASES, checkdeb_orig,
+                            run_check_checkdeb, tmpdir, fails)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
