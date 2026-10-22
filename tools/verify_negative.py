@@ -539,6 +539,18 @@ CASES = [
         'static NSString *const NLWMasterKeyGone      = @"MasterEnabled";',
         "有独立的总开关键 NLWMasterKey",
     ),
+    (
+        "★★ 去掉 [sw] 有效开关日志（出问题时看不出插件认的是哪个值）",
+        "[sw] master=%d longpress=%d flash=%d btn=%d swipe=%d",
+        "[sw-off] diag disabled",
+        "诊断版打印 [sw] 有效开关值",
+    ),
+    (
+        "★★ 设置变化只看长按开关（关别的项时已压制手势不恢复）",
+        "            BOOL anyTurnedOff = (!gEnabled && prev[0]) ||",
+        "            BOOL notTurnedOff = (!gEnabled && prev[0]) ||",
+        "设置变化时按「任一项由开变关」恢复已压制手势",
+    ),
 ]
 
 # ★ B 组：构建闸门本身的判据写错（真实误报过一次，潜伏三个 run 才暴露）

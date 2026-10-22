@@ -1749,10 +1749,19 @@ static void NLWOnPrefsChanged(CFNotificationCenterRef center, void *observer,
     // ★ 通知回调不保证在主线程。UI 相关操作（改手势 enabled）必须在主线程。
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            BOOL wasEnabled = gEnabled;
-            NLWLoadSwitches();      // 重新读两个开关
+            // ★★ 2.0-1：判据从「只看长按」改为「四项里任意一项由开变关」。
+            //   1.9-1 只比 gEnabled（当时它兼总开关，勉强算对）；
+            //   现在 gEnabled 只管长按，若仍只看它，用户「只关左滑」时
+            //   已经压掉的手势就不会恢复 —— 表现为「关了左滑，左滑还能用」。
+            int prev[4] = { (int)gEnabled, (int)gBlockCameraSwipe,
+                            (int)gBlockCameraButton, (int)gBlockFlashlight };
+            NLWLoadSwitches();      // 重新读全部开关
 
-            if (wasEnabled && !gEnabled) {
+            BOOL anyTurnedOff = (!gEnabled && prev[0]) ||
+                                (!gBlockCameraSwipe && prev[1]) ||
+                                (!gBlockCameraButton && prev[2]) ||
+                                (!gBlockFlashlight && prev[3]);
+            if (anyTurnedOff) {
                 // 开 → 关：把已经改掉的手势恢复原样，立刻生效
                 NLWRestoreAllSuppressed();
             }
@@ -1760,7 +1769,15 @@ static void NLWOnPrefsChanged(CFNotificationCenterRef center, void *observer,
             //   它每次被调用时会先看开关，关了就直接转发原实现。
             //   这比「改回原 IMP」安全：不漏恢复、不怕时序、无状态。
             // 关 → 开：什么也不用做。后续视图上屏 / 锁屏出现时，
-            //          hook 会因为 gEnabled 变回 YES 而重新压制。
+            //          hook 会因为开关变回 YES 而重新压制。
+
+            // ★ 2.0-1：把「插件认为的有效开关值」打出来。
+            //   总开关关掉时后面四项应当全为 0（掩码后的值）；
+            //   与设置页勾选不一致 = 读取出了问题，一眼能看出来。
+            NLWDiagAdd([NSString stringWithFormat:
+                @"[sw] master=%d longpress=%d flash=%d btn=%d swipe=%d",
+                (int)gMasterEnabled, (int)gEnabled, (int)gBlockFlashlight,
+                (int)gBlockCameraButton, (int)gBlockCameraSwipe]);
         } @catch (NSException *e) { }
     });
 }
@@ -1789,6 +1806,14 @@ __attribute__((constructor)) static void NLWInit(void)
 
         // ★ 开关状态读一次，之后热路径只读内存里的 BOOL。
         NLWLoadSwitches();
+
+        // ★ 2.0-1：启动时就把「有效开关值」写进日志。
+        //   总开关关掉时后面四项应当是 0（掩码后的值）——
+        //   这条线直接回答「插件到底认不认我的开关」。
+        NLWDiagAdd([NSString stringWithFormat:
+            @"[sw] master=%d longpress=%d flash=%d btn=%d swipe=%d",
+            (int)gMasterEnabled, (int)gEnabled, (int)gBlockFlashlight,
+            (int)gBlockCameraButton, (int)gBlockCameraSwipe]);
 
         // ★ 即使当前是关闭状态也照样装 hook + 装通知监听：
         //   否则用户在设置页把开关打开后，没有任何机制让插件「醒过来」。

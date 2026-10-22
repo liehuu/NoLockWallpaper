@@ -873,6 +873,30 @@ if os.path.isfile(_rootpl2) and m_master:
         "" if ("<string>%s</string>" % _mk) in _rp2 else
         "设置页没有总开关项 → 用户看不到也拨不到")
 
+# ★ 2.0-1 新增的诊断行。交付文档里已经承诺了 `[sw] master=...` 这一行，
+#   如果源码里没有，文档就是编的 —— 出问题时用户会照着找一行不存在的日志。
+#   查 src（含中文字面量会被存成 UTF-16，但这一行是纯 ASCII，走 __cstring）。
+_sw_log_cnt = src.count("[sw] master=")
+chk("诊断版打印 [sw] 有效开关值（启动 + 设置变化各一处）",
+    _sw_log_cnt >= 2,
+    "" if _sw_log_cnt >= 2 else
+    "只有 %d 处 → 设置页改了开关后看不到实际生效值" % _sw_log_cnt)
+
+# ★ 设置变化时必须「任一项由开变关」就恢复，不能只看某一个开关。
+#   1.9-1 只看 gEnabled，用户「只关左滑」时已压制的手势不会恢复。
+chk("设置变化时按「任一项由开变关」恢复已压制手势",
+    # ★ 判据要同时查「定义」和「使用」两处。
+    #   只查名字出现过是不够的（本项目第 4 次踩同一个坑）：
+    #   把 `BOOL anyTurnedOff = ...` 改名、而 `if (anyTurnedOff)` 保持原样，
+    #   名字仍然出现，判据照样通过 —— 反向验证会报「漏放」。
+    #   正确的语义是：有这样一个变量、且它真的被用来决定是否恢复。
+    "BOOL anyTurnedOff" in code and
+    re.search(r"if\s*\(\s*anyTurnedOff\s*\)", code) is not None and
+    re.search(r"NLWRestoreAllSuppressed\(\);\s*\n\s*\}", code) is not None,
+    "" if ("BOOL anyTurnedOff" in code and
+           re.search(r"if\s*\(\s*anyTurnedOff\s*\)", code) is not None) else
+    "只看某一个开关 → 关别的项时手势不恢复")
+
 
 # =====================================================================
 print("\n[A7] 热路径零 IO（watchdog 会杀进程）")
