@@ -49,10 +49,50 @@ xcrun clang -target "$TRIPLE" -isysroot "$SDK" \
   -Xlinker -install_name -Xlinker \
     "@loader_path/.jbroot/Library/MobileSubstrate/DynamicLibraries/NoLockWallpaper.dylib"
 
-# ---------- 2) 签名 ----------
+# ---------- 2) 编译设置页 bundle ----------
+# 设置页是个独立产物，跑在「设置」App 进程里（不是 SpringBoard）。
+#
+# ★ 为什么单独编一份 dylib 而不是把设置页代码塞进主 tweak：
+#   主 tweak 注入 SpringBoard，设置页要跑在 Preferences 进程里，
+#   两个进程、两套依赖，混在一起必然出事。
+#
+# ★ -F 指向自带的 Frameworks 目录：Preferences.framework 是私有框架，
+#   iOS SDK 里没有它的头文件/存根，所以我们自带一份 .tbd。
+#   .tbd 只提供「链接期符号声明」，不把库打进产物 —— 运行时由设置 App
+#   进程里已经加载的 Preferences.framework 提供实现。
+#
+# ★ -framework Preferences 与 -F 缺一不可：
+#   只 -F 不 -framework，链接器不会去解 PSListController 这些符号；
+#   只 -framework 不 -F，找不到 tbd。
+PREF_SRC="$ROOT/NoLockWallpaperPrefs"
+PREF_OUT="$BUILD/NoLockWallpaperPrefs.bundle"
+mkdir -p "$PREF_OUT"
+
+xcrun clang -target "$TRIPLE" -isysroot "$SDK" \
+  -dynamiclib -fobjc-arc -Os -Wall -Wextra \
+  -Wno-unused-parameter \
+  -undefined dynamic_lookup \
+  -I"$PREF_SRC" \
+  -F"$PREF_SRC/Frameworks" \
+  -framework Foundation -framework UIKit -framework Preferences \
+  "$PREF_SRC/NoLockWallpaperRootListController.m" \
+  -o "$PREF_OUT/NoLockWallpaperPrefs" \
+  -Xlinker -install_name -Xlinker \
+    "@loader_path/NoLockWallpaperPrefs.bundle/NoLockWallpaperPrefs"
+
+codesign --force --sign - "$PREF_OUT/NoLockWallpaperPrefs"
+
+# ★ 设置页产物必须也过架构闸门。
+#   主 dylib 的闸门管不到它 —— 这里漏检的后果是「插件能用但设置页白屏」，
+#   或者更糟：架构不对导致写了 arm64e 设备也加载不上。
+xcrun lipo -info "$PREF_OUT/NoLockWallpaperPrefs" | grep -q "$CPU" \
+  || { echo "✗ 设置页 bundle 缺 ${CPU} 切片"; exit 1; }
+echo "✓ 设置页 bundle 架构校验通过（${CPU}）"
+
+# ---------- 3) 签名 ----------
 codesign --force --sign - "$BUILD/NoLockWallpaper.dylib"
 
-# ---------- 3) 架构硬闸门 ----------
+# ---------- 4) 架构硬闸门 ----------
 echo "--- dylib ---"
 file "$BUILD/NoLockWallpaper.dylib"
 xcrun lipo -info "$BUILD/NoLockWallpaper.dylib"
@@ -65,7 +105,7 @@ xcrun lipo -info "$BUILD/NoLockWallpaper.dylib" | grep -q "$CPU" \
 #   set -u 下直接 unbound variable（SingleVPN 项目 CI 实测踩过）。
 echo "✓ 架构校验通过（${CPU}）"
 
-# ---------- 4) 功能指纹闸门 ----------
+# ---------- 5) 功能指纹闸门 ----------
 # 这些符号/字符串任何一条丢了，产物表面看不出来，装到机器上就是功能缺失。
 # ★ ObjC 选择子不进 nm -u（走 _objc_msgSend + __objc_methname），只能 grep -a。
 #
@@ -83,19 +123,49 @@ for sym in addGestureRecognizer: didMoveToWindow viewDidAppear: \
   grep -aq "$sym" "$BUILD/NoLockWallpaper.dylib" \
     || { echo "✗ dylib 缺 ${sym}（功能会缺失）"; exit 1; }
 done
+
+# 相机滑动相关指纹：edge pan 判据与右边缘枚举值
+for sym in UIScreenEdgePanGestureRecognizer edges Camera; do
+  grep -aq "$sym" "$BUILD/NoLockWallpaper.dylib" \
+    || { echo "✗ dylib 缺 ${sym}（禁左滑进相机会失效）"; exit 1; }
+done
+
+# 设置页开关读取指纹：配置域名与两个键名
+for sym in com.liehuu.nolockwallpaper Enabled BlockCameraSwipe \
+           com.liehuu.nolockwallpaper/changed; do
+  grep -aq "$sym" "$BUILD/NoLockWallpaper.dylib" \
+    || { echo "✗ dylib 缺 ${sym}（开关会失效）"; exit 1; }
+done
 echo "✓ 功能指纹齐全"
 
-# ---------- 5) 崩溃防护静态断言 ----------
+# 设置页产物指纹：控制器类名与配置域
+for sym in NoLockWallpaperRootListController com.liehuu.nolockwallpaper; do
+  grep -aq "$sym" "$PREF_OUT/NoLockWallpaperPrefs" \
+    || { echo "✗ 设置页缺 ${sym}（进设置页会白屏）"; exit 1; }
+done
+echo "✓ 设置页指纹齐全"
+
+# ---------- 6) 崩溃防护静态断言 ----------
 # 这几条是「崩宿主」维度，不是「编不过」维度，必须在产物上验。
 grep -aq 'objc_msgSend\|objc_msg_lookup' "$BUILD/NoLockWallpaper.dylib" \
   || echo "  提示：未见动态消息发送符号（可能已被优化，非致命）"
 
 # 必须存在异常处理相关段（@try/@catch 生效的证据）
-if xcrun otool -l "$BUILD/NoLockWallpaper.dylib" | grep -q '__objc_exception'; then
-  echo "✓ 存在 ObjC 异常处理元数据（@try 生效）"
+# ★ 段名别记错：ObjC 的 @try 落点是 __TEXT 段里的 __gcc_except_tab（LSDA），
+#   配合 __objc_personality_v0 符号。**不存在**叫 __objc_exception 的段 ——
+#   第一版判据查的就是这个名字，永远匹配不到，等于这条闸门从来没生效过。
+if xcrun otool -l "$BUILD/NoLockWallpaper.dylib" | grep -q '__gcc_except_tab'; then
+  echo "✓ 存在 __gcc_except_tab 段（@try 的 LSDA 落点）"
 else
-  echo "  提示：未见 __objc_exception 标记，异常的 @try 可能被优化掉"
+  echo "✗ 缺 __gcc_except_tab：@try/@catch 可能被优化掉，异常会漏出线程"
+  exit 1
+fi
+if xcrun otool -l "$BUILD/NoLockWallpaper.dylib" | grep -q '__objc_personality'; then
+  echo "✓ 存在 __objc_personality（ObjC 异常运行时挂钩）"
+else
+  echo "✗ 缺 __objc_personality：异常可能漏出线程"
+  exit 1
 fi
 
-# ---------- 6) 打包 ----------
+# ---------- 7) 打包 ----------
 sh "$ROOT/devkit/mkdeb.sh" "$ARCH_NAME" "$VER"

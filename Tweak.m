@@ -1,16 +1,32 @@
 //
-//  NoLockWallpaper —— 禁掉「锁屏长按弹出更换壁纸」
+//  NoLockWallpaper —— 锁屏防误触（禁长按换壁纸 / 禁左滑进相机）
 //
-//  需求原话：手机锁屏时，长按屏幕就会跳出更换壁纸的选项，经常误触，
-//            帮我禁掉这个功能，锁屏长按不会出现更换壁纸。
+//  需求原话：
+//    ① 手机锁屏时，长按屏幕就会跳出更换壁纸的选项，经常误触，
+//       帮我禁掉这个功能，锁屏长按不会出现更换壁纸。
+//    ② 帮我增加一个禁掉左滑进相机的功能（锁屏左滑不再打开相机）。
+//    ③ 在设置里增加个开关吧，我想关闭这个功能时能去关掉。
 //
 //  目标设备：iOS 17.0.3 / arm64e / RootHide（jbroot）
 //
 // ============================================================================
+//  1.1 主要变更
+// ============================================================================
+//  · 新增：设置页开关（设置 → NoLockWallpaper），改完**立即生效**，不用 respring。
+//    配置域 com.liehuu.nolockwallpaper，键 Enabled / BlockCameraSwipe。
+//  · 新增：禁锁屏左滑进相机。
+//  · 移除：日志落盘、手势清单 dump、iOS 版本探测。
+//    它们当初的唯一用途是「区分没生效和崩了」，功能已实机验证通过后
+//    只剩 IO 负担 —— 而 didMoveToWindow 是上屏热路径，写盘是被 watchdog
+//    杀进程的经典成因。删掉是净收益。
+//  · 保留 killswitch 文件：那不是诊断，是应急阀 —— 万一设置 App 都进不去，
+//    还能靠文件系统把插件停掉。
+//
+// ============================================================================
 //  ★★ 核心思路：不猜私有方法名，只在「公开 API 的必经之路」上拦
 // ============================================================================
-//  锁屏长按换壁纸，最终一定是「一个 UILongPressGestureRecognizer 挂在
-//  锁屏视图上」。这个手势必然经过 UIView -addGestureRecognizer:。
+//  锁屏长按换壁纸、左滑进相机，最终都表现为「一个 UIGestureRecognizer
+//  挂在锁屏视图上」。这些手势必然经过 UIView -addGestureRecognizer:。
 //  在那个时刻把它压掉，就不需要知道任何私有 selector 名。
 //
 //  为什么这条路比 hook 私有方法安全一个数量级：
@@ -25,7 +41,10 @@
 //      手势被添加的那一刻就压制。最根本的时机，不依赖视图何时上屏。
 //
 //  第 1 层（补）：UIView -didMoveToWindow
-//      视图上屏时再压一次。盖住「系统添加后又把 enabled 改回 YES」。
+//      视图上屏时再压一次。盖住两种真实情况：
+//        · 系统添加后又把 enabled 改回 YES
+//        · 手势参数（如 edge pan 的 edges）在 add 之后才设置，
+//          add 那一刻还判不出来 —— 上屏时参数已定，这层能补上
 //
 //  第 2 层（补）：锁屏控制器 -viewDidAppear:
 //      整个锁屏页出现时再整体扫一遍。盖住「手势加载得比本插件更早」。
@@ -34,9 +53,22 @@
 //  ★★★ 最重要的安全边界：绝不下钻子视图 ★★★
 // ============================================================================
 //  锁屏上还有：通知列表长按（必须保留）、手电筒/相机按钮（必须保留）、
-//  时钟小组件长按（必须保留）。
+//  时钟小组件长按（必须保留）、**上滑解锁/下拉通知（必须保留）**。
 //  所以每层都**只看当前视图自身**的 gestureRecognizers，绝不递归 subviews。
-//  一旦下钻，就是把锁屏上所有长按全废 —— 属于严重误伤，绝不能做。
+//  一旦下钻，就是把锁屏上所有手势全废 —— 属于严重误伤，绝不能做。
+//
+// ============================================================================
+//  ★★ 两个功能各自的精确判据（克制是关键）
+// ============================================================================
+//  ① 禁长按换壁纸：命中「锁屏壁纸区」+ 长按类手势 → 压制。
+//  ② 禁左滑进相机：命中「锁屏壁纸区」+ 且满足下面任一条 → 压制。
+//       a) UIScreenEdgePanGestureRecognizer 且 edges 含 UIRectEdgeRight
+//          —— 锁屏从右边缘往左滑就是相机，这是公开属性，不猜任何东西
+//       b) 宿主视图类名链含 "Camera" 且手势是 pan 类
+//     ★ 为什么绝不用「压掉锁屏上所有 pan」这种粗暴做法：
+//       上滑解锁、下拉开通知都是垂直 pan。一刀切会把解锁废掉 ——
+//       那比原需求破坏性大得多，属于绝对不可接受的误伤。
+//       edges == UIRectEdgeRight 只覆盖「右边缘横向滑动」，与解锁无交集。
 //
 // ============================================================================
 //  ★★ 崩宿主防护（本项目铁律，每条对应一次真实事故）
@@ -46,123 +78,74 @@
 //      viewDidAppear 都是宿主必须完成的回调，**无论如何先转发再压制**。
 //      不转发 addGestureRecognizer 会让 gesture.view 保持 nil，
 //      系统后续代码读它可能崩 —— 所以顺序是「转发 → 压制」，不是「不转发」。
-//   3. 热路径零 IO：日志只在首次命中时写，其余全是内存操作
+//   3. 热路径零 IO：开关状态只存在内存里，热路径只读一个 BOOL
 //   4. 不访问私有属性，全部公开 API + 消息发送
 //   5. hook 装不上（类/sel 不存在）就干净跳过，绝不硬上
 //   6. 构造器整体 try/catch，任何异常都不影响 SpringBoard 启动
-//   7. 提供 killswitch：/var/mobile/Library/Preferences/com.liehuu.nlw.disabled
-//      文件存在时插件完全不动手 —— 出问题不用卸载，删文件即可
+//   7. 应急阀：/var/mobile/Library/Preferences/com.liehuu.nlw.disabled
+//      文件存在时插件完全不动手 —— 设置 App 都进不去时还能靠它停用
 //
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <CoreFoundation/CFNotificationCenter.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <string.h>
 
 // ============================================================================
-//  一、日志
+//  一、设置页开关（读一次，之后只读内存）
 // ============================================================================
+//  ★ 为什么开关状态存在内存里，不在 hook 里读 CFPreferences：
+//    UIView -didMoveToWindow 是**所有视图上屏的必经路径**。SpringBoard 启动
+//    期几百个视图各走一遍，每次读 CFPreferences 都是 syscall + plist 解析。
+//    这属于「hook 热路径里做 IO」，是 watchdog 杀进程的经典成因。
+//    所以：构造器读一次 + 设置页改动时通过 Darwin 通知推一次，其余全是 BOOL。
 
-static NSString *const NLWLogSubdir = @"NoLockWallpaper";
-static NSString *const NLWLogName   = @"nlw.log";
+static NSString *const NLWPrefsDomain        = @"com.liehuu.nolockwallpaper";
+static NSString *const NLWEnabledKey         = @"Enabled";
+static NSString *const NLWBlockCameraKey     = @"BlockCameraSwipe";
+/// 与 Root.plist 里 PSSwitchCell 的 PostNotification 必须**完全一致**。
+/// 不一致 = 改了开关没反应，且看不出原因（这类问题排查成本极高）。
+static NSString *const NLWChangedNotification = @"com.liehuu.nolockwallpaper/changed";
 
-static NSString *NLWLogDir(void)
+/// 功能总开关。关闭时 hook 仍然装着，但一进判据就放行 ——
+/// 这样「关掉」是零开销的（一次 BOOL 判断），而恢复已压制的手势也能做。
+static BOOL gEnabled          = YES;
+/// 禁左滑进相机的子开关（用户可能只想禁长按、保留相机）。
+static BOOL gBlockCameraSwipe = YES;
+
+static BOOL NLWReadBool(NSString *key, BOOL fallback)
 {
-    static NSString *cached = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSMutableArray *cands = [NSMutableArray arrayWithObjects:
-            @"/var/mobile/Library/Logs",
-            @"/var/jb/var/mobile/Library/Logs",
-            nil];
-
-        // 从 dylib 自身路径反推 jbroot（RootHide 下形如 <jbroot>/Library/...）
-        Dl_info info;
-        if (dladdr((const void *)NLWLogDir, &info) && info.dli_fname) {
-            NSString *selfPath = [NSString stringWithUTF8String:info.dli_fname];
-            NSRange r = [selfPath rangeOfString:@"/Library/MobileSubstrate/DynamicLibraries"];
-            if (r.location != NSNotFound) {
-                NSString *jbroot = [selfPath substringToIndex:r.location];
-                if (jbroot.length) {
-                    [cands addObject:
-                        [jbroot stringByAppendingPathComponent:@"var/mobile/Library/Logs"]];
-                }
-            }
-        }
-
-        NSFileManager *fm = [NSFileManager defaultManager];
-        for (NSString *base in cands) {
-            @try {
-                NSString *dir = [base stringByAppendingPathComponent:NLWLogSubdir];
-                BOOL isDir = NO;
-                if (![fm fileExistsAtPath:dir isDirectory:&isDir]) {
-                    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES
-                                   attributes:nil error:nil];
-                }
-                if (![fm fileExistsAtPath:dir isDirectory:&isDir] || !isDir) continue;
-                NSString *probe = [dir stringByAppendingPathComponent:@".probe"];
-                if ([@"p" writeToFile:probe atomically:YES
-                            encoding:NSUTF8StringEncoding error:nil]) {
-                    [fm removeItemAtPath:probe error:nil];
-                    cached = dir;
-                    break;
-                }
-            } @catch (NSException *e) { }
-        }
-    });
-    return cached;
+    BOOL on = fallback;
+    @try {
+        CFStringRef domain = (__bridge CFStringRef)NLWPrefsDomain;
+        // Synchronize 会「刷出挂起的写 + 从磁盘重读」，
+        // 因此这里拿到的一定是设置 App 刚写下的最新值，不是旧缓存。
+        CFPreferencesAppSynchronize(domain);
+        Boolean present = false;
+        Boolean v = CFPreferencesGetAppBooleanValue((__bridge CFStringRef)key,
+                                                    domain, &present);
+        if (present) on = (v != 0);
+    } @catch (NSException *e) {
+        // 读失败按默认值处理：最坏是功能照常生效，而不是静默失效
+        on = fallback;
+    }
+    return on;
 }
 
-static void NLWLog(NSString *msg)
+/// 键缺失时一律按「开启」：装完就该生效。
+/// 不能因为用户还没进过设置页、配置文件还没落盘，就让插件静默失效 ——
+/// 那会被当成「装坏了」，排查成本极高。
+static void NLWLoadSwitches(void)
 {
-    @try {
-        NSString *dir = NLWLogDir();
-        if (!dir) return;
-        NSString *path = [dir stringByAppendingPathComponent:NLWLogName];
-        NSString *line = [NSString stringWithFormat:@"%@\n", msg];
-        NSFileManager *fm = [NSFileManager defaultManager];
-
-        if ([fm fileExistsAtPath:path]) {
-            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-            if (fh) {
-                @try {
-                    [fh seekToEndOfFile];
-                    [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-                } @finally {
-                    [fh closeFile];
-                }
-                return;
-            }
-        }
-        [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        // 锁屏时默认文件保护是 NSFileProtectionComplete，未解锁前读不到；
-        // 放宽到「首次解锁后即可读」，用户解锁后就能用 Filza 打开。
-        // ★ 常量名别记错：iOS 只有这四个
-        //     NSFileProtectionComplete
-        //     NSFileProtectionCompleteUnlessOpen
-        //     NSFileProtectionCompleteUntilFirstUserAuthentication  ← 本处用的
-        //     NSFileProtectionNone
-        //   「...UntilFirstAccess」是**不存在**的名字，写错会直接编译失败
-        //   （CI 实测：error: use of undeclared identifier）。
-        [fm setAttributes:@{ NSFileProtectionKey :
-                                 NSFileProtectionCompleteUntilFirstUserAuthentication }
-             ofItemAtPath:path error:nil];
-    } @catch (NSException *e) { }
-}
-
-static NSString *NLWiOSVersion(void)
-{
-    @try {
-        NSOperatingSystemVersion v = [NSProcessInfo processInfo].operatingSystemVersion;
-        return [NSString stringWithFormat:@"%ld.%ld.%ld",
-                (long)v.majorVersion, (long)v.minorVersion, (long)v.patchVersion];
-    } @catch (NSException *e) { return @"?"; }
+    gEnabled          = NLWReadBool(NLWEnabledKey,     YES);
+    gBlockCameraSwipe = NLWReadBool(NLWBlockCameraKey, YES);
 }
 
 // ============================================================================
-//  二、killswitch（出问题时不用卸载，删文件即可）
+//  二、应急阀（设置 App 都进不去时的最后手段）
 // ============================================================================
 
 static BOOL NLWIsKilled(void)
@@ -185,7 +168,7 @@ static BOOL NLWIsKilled(void)
 }
 
 // ============================================================================
-//  三、判据：这个视图算不算「锁屏的一部分」
+//  三、判据：类名链
 // ============================================================================
 
 /// 沿父类链找锁屏相关字样。
@@ -199,6 +182,10 @@ static BOOL NLWIsKilled(void)
 /// ★ 为什么不会误伤主屏图标长按：
 ///   SBIconView / SBIconListView / SBHomeScreenViewController 的类名链
 ///   不含上述字样，直接不命中。
+///
+/// ★ 为什么写成单次遍历查多个关键字（而不是调用 NLWChainHas 五次）：
+///   本函数在 didMoveToWindow 里对每个视图、每层祖先都会被调用，
+///   遍历类链 × 5 次是 5 倍开销。一次遍历内比对 5 个串才是热路径写法。
 static BOOL NLWIsLockScreenish(id obj)
 {
     if (!obj) return NO;
@@ -215,6 +202,21 @@ static BOOL NLWIsLockScreenish(id obj)
     return NO;
 }
 
+/// 沿父类链找任意关键字。用于「相机相关视图」这类低频判据。
+static BOOL NLWChainHas(id obj, const char *needle)
+{
+    if (!obj || !needle) return NO;
+    for (Class c = object_getClass(obj); c != Nil; c = class_getSuperclass(c)) {
+        const char *n = class_getName(c);
+        if (n && strstr(n, needle)) return YES;
+    }
+    return NO;
+}
+
+// ============================================================================
+//  四、判据：手势类型
+// ============================================================================
+
 /// 是否「长按类」手势。
 ///
 /// ★ 为什么不只判 isKindOfClass:[UILongPressGestureRecognizer class]：
@@ -222,8 +224,6 @@ static BOOL NLWIsLockScreenish(id obj)
 ///   （继承 UILongPressGestureRecognizer 时 isKindOfClass 已经覆盖），
 ///   但也存在「不继承、自己从 UIGestureRecognizer 派生」的实现可能。
 ///   类名带 LongPress 的按名判一次，属于零成本兜底。
-///   ★ 为什么这个放宽不危险：本函数只在「已确认是锁屏壁纸区」之后才被调用，
-///     作用域已经被三重判据收窄；且只要有 LongPress 字样，语义上就是要压的。
 static BOOL NLWIsLongPressish(UIGestureRecognizer *g)
 {
     if (!g) return NO;
@@ -235,22 +235,128 @@ static BOOL NLWIsLongPressish(UIGestureRecognizer *g)
     return NO;
 }
 
+/// 是否「滑动类」手势（pick up 出来做类名兜底用）。
+static BOOL NLWIsPanish(UIGestureRecognizer *g)
+{
+    if (!g) return NO;
+    if ([g isKindOfClass:[UIPanGestureRecognizer class]]) return YES;   // 含 edge pan 子类
+    @try {
+        const char *n = class_getName(object_getClass(g));
+        if (n && strstr(n, "Pan")) return YES;
+    } @catch (NSException *e) { }
+    return NO;
+}
+
+/// 是否「从右边缘往左滑 → 进相机」的手势。
+///
+/// ★★ 为什么这个判据是安全的（不会废掉上滑解锁）：
+///   锁屏「左滑进相机」= 手指从**屏幕右边缘**往左划 → 横向 edge pan。
+///   「上滑解锁」「下拉开通知」= 垂直 pan，且不从上边缘起手。
+///   `UIScreenEdgePanGestureRecognizer.edges` 是**公开 API**，
+///   值为 UIRectEdgeRight 时只匹配「右边缘起手」，与解锁手势零交集。
+///
+/// ★★ 为什么绝不用「压掉锁屏上所有 pan」这种粗暴做法：
+///   上滑解锁就是垂直 pan。一刀切会把**解锁废掉** —— 那比原需求
+///   破坏性大得多，属于绝对不可接受的误伤。宁可漏压也不能这样做。
+///
+/// ★ 三层判据，从精确到兜底：
+///   a) 是 UIScreenEdgePanGestureRecognizer 且 edges 含 Right
+///      最精确、零猜测。锁屏相机入口的标准实现。
+///   b) 手势类名含 EdgePan / ScreenEdge（自定义子类的兜底）
+///      系统若用自有类做边缘手势，继承关系可能不是 UIKit 那个类，
+///      但命名习惯一定留痕。
+///   c) 宿主类名链含 Camera 且手势是滑动类
+///      盖住「不用边缘手势、直接把 pan 挂相机预览容器」的实现。
+///      ★ 限定 pan，避免把相机界面上的点按（快门）一起废掉。
+///
+///   三条都限定在「已确认是锁屏可压制区域」之后才被调用，
+///   作用域已经收窄，不会扩散到主屏或 App 内。
+static BOOL NLWIsCameraSwipeish(UIGestureRecognizer *g, UIView *host)
+{
+    if (!g) return NO;
+
+    // a) 右边缘 edge pan —— 锁屏相机的标准手势
+    @try {
+        if ([g isKindOfClass:[UIScreenEdgePanGestureRecognizer class]]) {
+            UIRectEdge e = ((UIScreenEdgePanGestureRecognizer *)g).edges;
+            if (e & UIRectEdgeRight) return YES;
+        }
+    } @catch (NSException *e) { }
+
+    // b) 类名兜底：自定义边缘手势类
+    @try {
+        const char *n = class_getName(object_getClass(g));
+        if (n && (strstr(n, "EdgePan") || strstr(n, "ScreenEdge"))) {
+            // ★ 必须同时是「滑动」语义。只按类名压，可能把同族的
+            //   非滑动手势一起废掉。
+            // ★ 这里读不到 edges（它不是 UIScreenEdgePanGestureRecognizer，
+            //   强转读属性属于猜类型，可能拿到垃圾值），所以按「锁屏上
+            //   的边缘滑动」直接认定。
+            //   为什么这个放宽是可接受的：锁屏壁纸区不存在「左边缘返回」
+            //   这类手势（那是 App 内导航），锁屏上的边缘 pan 只有相机入口。
+            //   且整条判据已经被「锁屏可压制区域」收窄过一次。
+            if (NLWIsPanish(g)) return YES;
+        }
+    } @catch (NSException *e) { }
+
+    // c) 宿主在相机容器上，且手势是滑动类
+    @try {
+        if (NLWIsPanish(g) && NLWChainHas(host, "Camera")) return YES;
+    } @catch (NSException *e) { }
+
+    return NO;
+}
+
 // ============================================================================
-//  四、压制动作
+//  五、压制动作（含「记住原状」以支持实时恢复）
 // ============================================================================
 
-static NSUInteger gSuppressedTotal   = 0;
-static BOOL       gLoggedFirstSuppress = NO;
-static BOOL       gLoggedInventory     = NO;
+/// weak key → 原状（dict：dur / en），用来支持「关掉开关立即恢复」。
+///
+/// ★ 为什么必须记住原值而不是恢复成硬编码值：
+///   ① 系统给锁屏手势设的 minimumPressDuration 未必是 UIKit 默认 0.5。
+///      恢复成猜的值，用户关掉开关后长按手感会变（变快或变慢），
+///      属于「关了但没完全关」的隐性缺陷。
+///   ② 更要紧的是 enabled：有些手势被添加时系统就设成 NO（稍后才启用）。
+///      一律恢复成 YES 会**擅自打开本不该开的手势**，可能引发意料外的行为。
+///      必须原样还原。
+/// ★ 为什么用 weak 表：这些手势随视图销毁而释放，强持有会拖住整棵视图树。
+static NSString *const NLWOrigDurKey = @"dur";
+static NSString *const NLWOrigEnKey  = @"en";
+static NSMapTable *gSuppressed = nil;
 
-static void NLWSuppressGesture(UIGestureRecognizer *g, const char *where)
+static void NLWSuppressGesture(UIGestureRecognizer *g)
 {
     if (!g) return;
 
+    // 记原状（必须在改动之前取）
+    @try {
+        if (!gSuppressed) {
+            gSuppressed = [NSMapTable weakToStrongObjectsMapTable];
+        }
+        // ★★ 只在**首次**记录。绝不能覆盖 —— 这是必然触发的问题，不是理论风险：
+        //   didMoveToWindow 每次上屏都会走一遍压制，同一个手势会被反复处理。
+        //   若每次都写入「当前值」，第二次取到的就已是我改过的 90.0 / NO，
+        //   覆盖后「原状」变成 90 秒，用户关掉开关后长按依然是 90 秒 ——
+        //   等于开关失效，而且极难排查（表面看恢复代码执行了）。
+        if ([gSuppressed objectForKey:g] == nil) {
+            BOOL wasEnabled = YES;
+            @try { wasEnabled = g.enabled; } @catch (NSException *e) { }
+
+            NSMutableDictionary *orig = [NSMutableDictionary dictionary];
+            orig[NLWOrigEnKey] = @(wasEnabled);
+            if ([g isKindOfClass:[UILongPressGestureRecognizer class]]) {
+                orig[NLWOrigDurKey] =
+                    @(((UILongPressGestureRecognizer *)g).minimumPressDuration);
+            }
+            [gSuppressed setObject:orig forKey:g];
+        }
+    } @catch (NSException *e) { }
+
     // 双保险：
-    //   enabled=NO          → 常规手段
+    //   enabled=NO           → 常规手段
     //   minimumPressDuration → 万一系统把 enabled 改回 YES，
-    //                         90 秒的长按人类按不出来，等于永久失效
+    //                          90 秒的长按人类按不出来，等于永久失效
     // ★ 顺序不能反：先设 duration 再关 enabled。
     //   minimumPressDuration 是 UILongPressGestureRecognizer 的属性，
     //   必须在手势还「活着」的时候写；先 disable 再写有极小概率被
@@ -261,24 +367,46 @@ static void NLWSuppressGesture(UIGestureRecognizer *g, const char *where)
         }
     } @catch (NSException *e) { }
     @try { g.enabled = NO; } @catch (NSException *e) { }
-
-    gSuppressedTotal++;
-    if (gLoggedFirstSuppress) return;      // 热路径：只写一次盘
-    gLoggedFirstSuppress = YES;
-
-    NSString *gcls = @"?", *vcls = @"?";
-    @try { gcls = NSStringFromClass(object_getClass(g)); } @catch (NSException *e) { }
-    @try { vcls = NSStringFromClass([g.view class]); }    @catch (NSException *e) { }
-
-    NLWLog([NSString stringWithFormat:
-        @"[nlw] >>> 已禁用锁屏长按（首次）via %s\n"
-         "      手势类: %@\n"
-         "      宿主类: %@\n"
-         "      iOS: %@\n",
-        where, gcls, vcls, NLWiOSVersion()]);
 }
 
-/// 视图 v 是否属于「锁屏壁纸区」，可以安全压制其长按。
+/// 把所有已压制的手势恢复原状。开关从「开」切到「关」时调用。
+///
+/// ★ 为什么需要这一步（否则开关是假的）：
+///   压制手段是改手势实例本身。已经改掉的实例不会因为「以后不再压制」
+///   就自动复活 —— 它们活在 SpringBoard 内存里。不恢复的话，用户关掉
+///   开关后长按依然没反应，会认为「开关坏了」。
+static void NLWRestoreAllSuppressed(void)
+{
+    @try {
+        if (!gSuppressed) return;
+        NSArray *keys = [[gSuppressed keyEnumerator] allObjects];
+        for (UIGestureRecognizer *g in keys) {
+            @try {
+                NSDictionary *orig = [gSuppressed objectForKey:g];
+                if (![orig isKindOfClass:[NSDictionary class]]) continue;
+
+                id dur = orig[NLWOrigDurKey];
+                if ([g isKindOfClass:[UILongPressGestureRecognizer class]] &&
+                    [dur isKindOfClass:[NSNumber class]]) {
+                    ((UILongPressGestureRecognizer *)g).minimumPressDuration =
+                        [dur doubleValue];
+                }
+                // ★ 还原成**原值**，不是无条件 YES
+                id en = orig[NLWOrigEnKey];
+                if ([en isKindOfClass:[NSNumber class]]) {
+                    g.enabled = [en boolValue];
+                }
+            } @catch (NSException *e) { }
+        }
+        [gSuppressed removeAllObjects];
+    } @catch (NSException *e) { }
+}
+
+// ============================================================================
+//  六、压制主逻辑
+// ============================================================================
+
+/// 视图 v 是否属于「锁屏壁纸区」，可以安全压制其手势。
 ///
 /// ★★ 这里有一个极易踩的误伤陷阱（v1.1 第一版就踩了，已修正）：
 ///   「祖先链含锁屏」这个判据太宽 —— 通知列表的 cell 也在锁屏视图之下，
@@ -320,12 +448,15 @@ static BOOL NLWIsSuppressibleLockScreenArea(UIView *v)
     return selfIsLS;
 }
 
-/// 处理一个视图**自身挂载**的手势。返回压制个数。
+/// 处理一个视图**自身挂载**的手势。
 /// ★ 绝不下钻 subviews —— 见文件头「最重要的安全边界」。
-static NSUInteger NLWProcessView(UIView *v, const char *where)
+static NSUInteger NLWProcessView(UIView *v)
 {
     NSUInteger n = 0;
     @try {
+        // ★ 总开关放在最前面：关闭时一次 BOOL 判断就返回，零分配零开销。
+        //   两个子功能都关掉时同样是零开销。
+        if (!gEnabled) return 0;
         if (!v) return 0;
 
         // ★ 顺序很重要：先做判据、后取 gestureRecognizers。
@@ -338,38 +469,25 @@ static NSUInteger NLWProcessView(UIView *v, const char *where)
         NSArray *gs = v.gestureRecognizers;
         if (gs.count == 0) return 0;
 
-        // 首次找到可压制的锁屏区域：把手势清单整体记下来。
-        // ★ 这是给「万一没生效」留的诊断口 —— 日志里能直接看到锁屏上
-        //   究竟是哪几个手势类、挂在什么类上、各自 enabled 状态，不必再靠猜。
-        if (!gLoggedInventory) {
-            gLoggedInventory = YES;
-            NSMutableString *inv = [NSMutableString string];
-            for (UIGestureRecognizer *g in gs) {
-                NSString *cn = @"?";
-                @try { cn = NSStringFromClass(object_getClass(g)); } @catch (NSException *e) { }
-                BOOL en = NO;
-                @try { en = g.enabled; } @catch (NSException *e) { }
-                [inv appendFormat:@"        - %@  enabled=%d\n", cn, (int)en];
-            }
-            NSString *vcls = @"?";
-            @try { vcls = NSStringFromClass([v class]); } @catch (NSException *e) { }
-            NLWLog([NSString stringWithFormat:
-                @"[nlw] 命中锁屏壁纸区 %@ via %s，该视图自身手势 %lu 个：\n%@",
-                vcls, where, (unsigned long)gs.count, inv]);
-        }
-
         for (UIGestureRecognizer *g in gs) {
-            if (NLWIsLongPressish(g)) {
-                NLWSuppressGesture(g, where);
-                n++;
-            }
+            @try {
+                if (NLWIsLongPressish(g)) {
+                    NLWSuppressGesture(g);
+                    n++;
+                    continue;
+                }
+                if (gBlockCameraSwipe && NLWIsCameraSwipeish(g, v)) {
+                    NLWSuppressGesture(g);
+                    n++;
+                }
+            } @catch (NSException *e) { }
         }
     } @catch (NSException *e) { }
     return n;
 }
 
 // ============================================================================
-//  五、hook 安装（纯运行时，不用 Logos）
+//  七、hook 安装（纯运行时，不用 Logos）
 // ============================================================================
 
 static IMP gOrigAddGesture    = NULL;
@@ -387,8 +505,7 @@ static IMP gOrigDidMove       = NULL;
 /// ★★★ 为什么用 dlsym 取符号，而不是直接写 &_objc_msgForward：
 ///   直接引用会在 dylib 的符号表里留下未定义符号绑定。本包用
 ///   -undefined dynamic_lookup 链接，编译期不报错，但**运行期若 dyld
-///   找不到该符号，整份 dylib 加载失败** —— 表现就是「插件完全没生效，
-///   连一行日志都没有」，这正是我们反复踩过的坑。
+///   找不到该符号，整份 dylib 加载失败** —— 表现就是「插件完全没生效」。
 ///   · _objc_msgForward_stret 在 arm64 上已从 libobjc 移除，
 ///     绝不能直接引用（arm64 是唯一目标架构，引用=必崩加载）
 ///   · 用 dlsym 拿到的是地址或 NULL，取不到也只是「这层保护不启用」，
@@ -430,8 +547,6 @@ static BOOL NLWInstallHook(Class cls, SEL sel, IMP newImp, IMP *origOut,
         Class sup = class_getSuperclass(cls);
 
         // ★ 优先走 method_getImplementation 取「本类真实存在的方法」。
-        //   只有确实没找到时，才看 class_getMethodImplementation 是否
-        //   落在父类上（= 继承关系）。两条路径都要过转发桩过滤。
         Method own = class_getInstanceMethod(cls, sel);
         if (!own) return NO;                    // 类根本没有这个方法 → 干净跳过
 
@@ -472,7 +587,7 @@ static BOOL NLWInstallHook(Class cls, SEL sel, IMP newImp, IMP *origOut,
 }
 
 // ============================================================================
-//  六、hook 实现
+//  八、hook 实现
 // ============================================================================
 
 // ---- 第 0 层（主）：addGestureRecognizer: ----
@@ -481,13 +596,15 @@ static void NLWAddGestureRecognizer(id self, SEL _cmd, UIGestureRecognizer *g)
 {
     BOOL hit = NO;
     @try {
-        // 两道便宜过滤：
-        //   ① 不是长按 → 立刻放过（绝大多数调用走这条路）
-        //   ② 宿主不是「锁屏壁纸区」→ 放过（含通知/滚动容器/UIControl 排除判据）
-        // ★ 长按判断统一走 NLWIsLongPressish，与后面的压制循环用同一判据。
-        //   两处各写一套 isKindOfClass 迟早会不一致（一处放宽一处没放宽
-        //   → 判为命中却一个都没压，或者反过来漏压）。
-        if (NLWIsLongPressish(g)) {
+        // 三道便宜过滤：
+        //   ① 总开关关着 → 不过问
+        //   ② 不是「长按」也不是「相机滑动」→ 立刻放过（绝大多数调用走这条路）
+        //   ③ 宿主不是「锁屏壁纸区」→ 放过（含通知/滚动容器/UIControl 排除判据）
+        // ★ 手势类型判断统一走 NLWIsLongPressish / NLWIsCameraSwipeish，
+        //   与后面的压制循环用同一判据。两处各写一套迟早会不一致
+        //   （一处放宽一处没放宽 → 判为命中却一个都没压，或者反过来漏压）。
+        if (gEnabled && (NLWIsLongPressish(g) ||
+                         (gBlockCameraSwipe && NLWIsCameraSwipeish(g, (UIView *)self)))) {
             hit = NLWIsSuppressibleLockScreenArea((UIView *)self);
         }
     } @catch (NSException *e) { }
@@ -498,14 +615,14 @@ static void NLWAddGestureRecognizer(id self, SEL _cmd, UIGestureRecognizer *g)
         ((void (*)(id, SEL, id))gOrigAddGesture)(self, _cmd, g);
     }
 
-    if (hit) NLWProcessView((UIView *)self, "addGestureRecognizer:");
+    if (hit) NLWProcessView((UIView *)self);
 }
 
 // ---- 第 1 层（补）：didMoveToWindow ----
 // 签名：- (void)didMoveToWindow   →  v@:
 static void NLWDidMoveToWindow(id self, SEL _cmd)
 {
-    @try { NLWProcessView((UIView *)self, "didMoveToWindow"); }
+    @try { NLWProcessView((UIView *)self); }
     @catch (NSException *e) { }
 
     if (gOrigDidMove) ((void (*)(id, SEL))gOrigDidMove)(self, _cmd);
@@ -538,32 +655,32 @@ static IMP NLWOrigViewDidAppearFor(id self)
     return NULL;
 }
 
-/// 扫描「本视图 + 其直接子视图」自身挂载的长按手势。返回压制个数。
+/// 扫描「本视图 + 其直接子视图」自身挂载的手势。
 ///
 /// ★ 为什么允许下探一层子视图：
-///   锁屏控制器 .view 往往是顶层容器，长按实际挂在它的壁纸容器子视图上。
-///   只扫顶层就会漏。
+///   锁屏控制器 .view 往往是顶层容器，手势实际挂在它的壁纸容器子视图上。
+///   只扫顶层就会漏。相机预览容器通常也是这一层。
 ///
 /// ★ 为什么只下探一层、不递归：
 ///   锁屏真正的层级是 控制器.view → (壁纸容器 | 通知列表 | 按钮栏)。
-///   通知列表 / 手电筒 / 相机都在同一层或更深，但它们**不在锁屏容器的
+///   通知列表 / 手电筒 / 相机按钮都在同一层或更深，但它们**不在锁屏容器的
 ///   直接子视图链上带长按**（通知是 UICollectionView 的 cell 内长按，
 ///   属于更深层）。只下探一层既能覆盖壁纸容器，又不会误伤通知。
 ///   而且 NLWProcessView 内部还有「路径经过 UIScrollView 即排除」这道
 ///   独立防线，即使层级判断有偏差也不会误伤通知。
 ///   ★ 若实测发现通知长按被影响，把这里改成只处理 0 层即可。
-static NSUInteger NLWProcessViewShallow(UIView *v, const char *where)
+static NSUInteger NLWProcessViewShallow(UIView *v)
 {
     NSUInteger n = 0;
     @try {
         if (!v) return 0;
-        n += NLWProcessView(v, where);
+        n += NLWProcessView(v);
 
         NSArray *subs = v.subviews;      // nil 安全
         NSUInteger cap = 0;
         for (UIView *s in subs) {
             if (++cap > 80) break;       // 防御：子视图异常多时不拖慢启动
-            n += NLWProcessView(s, where);
+            n += NLWProcessView(s);
         }
     } @catch (NSException *e) { }
     return n;
@@ -571,7 +688,7 @@ static NSUInteger NLWProcessViewShallow(UIView *v, const char *where)
 
 static void NLWViewDidAppear(id self, SEL _cmd, BOOL animated)
 {
-    @try { NLWProcessViewShallow([self view], "viewDidAppear:"); }
+    @try { NLWProcessViewShallow([self view]); }
     @catch (NSException *e) { }
 
     // ★ 无论如何都要转发原实现 —— 这是锁屏控制器自己的生命周期回调，
@@ -583,18 +700,64 @@ static void NLWViewDidAppear(id self, SEL _cmd, BOOL animated)
 }
 
 // ============================================================================
-//  七、构造：装 hook
+//  九、设置页改动实时生效（Darwin 通知）
+// ============================================================================
+//  ★ 为什么必须实时生效，而不是「改完请手动 respring」：
+//    压制手段是改手势实例本身。用户改完开关若没有任何反馈，他会认为
+//    开关坏了 —— 这是设计缺陷，不是用户的问题。
+//  ★ 为什么用 Darwin 通知而不是轮询：
+//    轮询要么放在热路径（禁），要么起定时器（SpringBoard 里常驻定时器
+//    是耗电与 watchdog 风险的来源）。通知是被动收到，零开销。
+//  ★ 通知名必须与 Root.plist 的 PostNotification 一致，见 NLWChangedNotification。
+
+static void NLWOnPrefsChanged(CFNotificationCenterRef center, void *observer,
+                              CFStringRef name, const void *object,
+                              CFDictionaryRef userInfo)
+{
+    // ★ 通知回调不保证在主线程。UI 相关操作（改手势 enabled）必须在主线程。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            BOOL wasEnabled = gEnabled;
+            NLWLoadSwitches();      // 重新读两个开关
+
+            if (wasEnabled && !gEnabled) {
+                // 开 → 关：把已经改掉的手势恢复原样，立刻生效
+                NLWRestoreAllSuppressed();
+            }
+            // 关 → 开：什么也不用做。后续视图上屏 / 锁屏出现时，
+            //          hook 会因为 gEnabled 变回 YES 而重新压制。
+        } @catch (NSException *e) { }
+    });
+}
+
+static void NLWStartObservingPrefs(void)
+{
+    @try {
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                        NULL,
+                                        NLWOnPrefsChanged,
+                                        (__bridge CFStringRef)NLWChangedNotification,
+                                        NULL,
+                                        CFNotificationSuspensionBehaviorDeliverImmediately);
+    } @catch (NSException *e) { }
+}
+
+// ============================================================================
+//  十、构造：装 hook
 // ============================================================================
 
 __attribute__((constructor)) static void NLWInit(void)
 {
     @try {
-        if (NLWIsKilled()) {
-            NLWLog(@"[nlw] 检测到 killswitch 文件，插件不启用（删掉该文件后重启桌面即可恢复）");
-            return;
-        }
+        // ★ 应急阀优先：它是最后的逃生口，无论开关怎么设都要先看它。
+        if (NLWIsKilled()) return;
 
-        NSMutableString *rep = [NSMutableString string];
+        // ★ 开关状态读一次，之后热路径只读内存里的 BOOL。
+        NLWLoadSwitches();
+
+        // ★ 即使当前是关闭状态也照样装 hook + 装通知监听：
+        //   否则用户在设置页把开关打开后，没有任何机制让插件「醒过来」。
+        //   装着 hook 的代价是每次回调多一次 BOOL 判断，纳秒级。
 
         // ---- 第 0 层：UIView 基类 ----
         // ★ 为什么 hook 基类而不是具体锁屏类：
@@ -607,9 +770,6 @@ __attribute__((constructor)) static void NLWInit(void)
             if (NLWInstallHook([UIView class], @selector(addGestureRecognizer:),
                                (IMP)NLWAddGestureRecognizer, &o, "v@:@")) {
                 gOrigAddGesture = o;
-                [rep appendString:@"  [主] UIView -addGestureRecognizer:\n"];
-            } else {
-                [rep appendString:@"  [主] UIView -addGestureRecognizer: 安装失败（跳过）\n"];
             }
         }
         {
@@ -617,9 +777,6 @@ __attribute__((constructor)) static void NLWInit(void)
             if (NLWInstallHook([UIView class], @selector(didMoveToWindow),
                                (IMP)NLWDidMoveToWindow, &o, "v@:")) {
                 gOrigDidMove = o;
-                [rep appendString:@"  [补] UIView -didMoveToWindow\n"];
-            } else {
-                [rep appendString:@"  [补] UIView -didMoveToWindow 安装失败（跳过）\n"];
             }
         }
 
@@ -635,10 +792,7 @@ __attribute__((constructor)) static void NLWInit(void)
         ];
         for (NSString *name in ctlClasses) {
             Class c = NSClassFromString(name);
-            if (!c) {
-                [rep appendFormat:@"  [补] %@ 不存在（跳过）\n", name];
-                continue;
-            }
+            if (!c) continue;
             IMP o = NULL;
             if (NLWInstallHook(c, @selector(viewDidAppear:),
                                (IMP)NLWViewDidAppear, &o, "v@:B")) {
@@ -647,7 +801,6 @@ __attribute__((constructor)) static void NLWInit(void)
                     gCtlCls[gCtlCount]  = c;
                     gCtlOrig[gCtlCount] = o;
                     gCtlCount++;
-                    [rep appendFormat:@"  [补] %@ -viewDidAppear:\n", name];
                 } else {
                     // 槽位满：orig 存不下来就意味着该类的生命周期回调会被截断，
                     // 风险高于「这层补丁少装一个」。宁可撤销 hook 也不能丢 orig。
@@ -655,24 +808,12 @@ __attribute__((constructor)) static void NLWInit(void)
                     if (m && o && !NLWIsForwardingIMP(o)) {
                         method_setImplementation(m, o);
                     }
-                    [rep appendFormat:@"  [补] %@ 槽位已满，本层跳过（不影响主层）\n", name];
                 }
-            } else {
-                [rep appendFormat:@"  [补] %@ -viewDidAppear: 安装失败（跳过）\n", name];
             }
         }
 
-        // ---- 启动记录 ----
-        // ★ 这条日志是「插件到底有没有跑起来」的唯一凭据。
-        //   装完看不到这条 → 插件没加载（不是没生效），要查加载问题；
-        //   看到了但长按还能换壁纸 → 是判据没命中，把日志发我。
-        NLWLog([NSString stringWithFormat:
-            @"[nlw] ==== NoLockWallpaper 启动 ====\n"
-             "[nlw] iOS %@\n"
-             "%@"
-             "[nlw] 预期：锁屏长按不再弹壁纸选择；主屏图标长按、锁屏通知长按不受影响\n"
-             "[nlw] 日志目录: %@\n",
-            NLWiOSVersion(), rep, (NLWLogDir() ?: @"(落盘失败)")]);
+        // ---- 设置页改动实时生效 ----
+        NLWStartObservingPrefs();
     } @catch (NSException *e) {
         // 构造器异常绝不外泄：最坏是插件不生效，宿主必须照常启动
     }

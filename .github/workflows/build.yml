@@ -8,7 +8,8 @@ on:
 env:
   # ★ 版本号单一来源：build.yml 的 env 与 mkdeb.sh 的入参由这里统一派生，
   #   禁止在别处硬编码（SingleVPN 踩过「包名 2.7、内容 2.8」的坑）。
-  VERSION: 1.0-1
+  # 1.0-1 → 1.1-1：加了设置页开关 + 禁左滑进相机，同时移除日志诊断。
+  VERSION: 1.1-1
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 

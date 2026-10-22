@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
+	<key>CFBundleDisplayName</key>
+	<string>NoLockWallpaper</string>
+	<key>CFBundleExecutable</key>
+	<string>NoLockWallpaperPrefs</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.liehuu.nolockwallpaperprefs</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<!-- ★ 必须是 BNDL：这是「设置 bundle」的包类型。
+	       写成 APPL 会让设置 App 尝试把它当独立应用启动。 -->
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.1.0</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>1.1</string>
+	<!-- ★ NSPrincipalClass 必须是设置页的主控制器类名，
+	       拼错 = 进设置页白屏（不会报错，极难排查）。 -->
+	<key>NSPrincipalClass</key>
+	<string>NoLockWallpaperRootListController</string>
+</dict>
+</plist>
