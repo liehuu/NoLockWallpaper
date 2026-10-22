@@ -355,215 +355,112 @@ CASES = [
         "压制循环里对相机入口类做了即时压制",
     ),
     # ------------------------------------------------------------------
-    # 1.7-1：hasCamera 方案（10 条）
-    # ★ 这一组守的是「四轮失败后终于走对的那条路」，每条都对应一个
-    #   真实可能犯的错，而不是凑数。
+    # 1.9-1：三个 bool getter + 三个开关（照抄已实测生效的插件）
+    # ★★ 这一组守的是「用户实测那份插件生效、而自己的 1.7-1 / 1.8-1 都不生效」
+    #    之后换的整条实现路径。每条都对应一个会**静默失效**的真实形态：
+    #    装没装上、装上了却没被调用、被调用了却转发错 —— 这些都不报错。
     # ------------------------------------------------------------------
     (
-        "去掉 -hasCamera 签名校验（Apple 改签名后必崩）",
-        '        BOOL encOK = (enc && (strncmp(enc, "B@:", 3) == 0 ||\n'
-        '                              strncmp(enc, "c@:", 3) == 0));',
-        "        BOOL encOK = YES;",
-        "签名不符时干净跳过",
+        "★ 不判方法存在就 MSHook（会对不存在的方法「成功」造出新方法，没人调）",
+        "        Method m = class_getInstanceMethod(cls, sel);\n"
+        "        if (!m) {\n",
+        "        Method m = class_getInstanceMethod(cls, sel);\n"
+        "        if (NO) {\n",
+        "对不存在的方法先判空再装",
     ),
     (
-        "安装时写死签名编码（addMethod 可能造出错误签名）",
-        "                            &o, enc)) {",
-        '                            &o, "B@:")) {',
-        "安装时用真实 enc 而非写死字面量",
+        "★ 不取 MSHookMessageEx，直接走自实现（1.7/1.8 失败的那条路）",
+        "        NLWMSHookFn ms = NLWGetMSHook();",
+        "        NLWMSHookFn ms = NULL;",
+        "★ 优先走 MSHookMessageEx",
     ),
     (
-        "开关关闭时不转发原实现（相机永久消失，开关变假）",
-        "            return ((BOOL (*)(id, SEL))gOrigHasCamera)(self, _cmd);",
-        "            return NO;",
-        "开关关着就转发原实现",
+        "★★ 用 dlopen 加载 substrate（第二份引擎改同一张方法表 = 必崩）",
+        "    if (gNLWMSHookDone) return gNLWMSHook;",
+        '    dlopen("@rpath/CydiaSubstrate.framework/CydiaSubstrate", 0);\n'
+        "    if (gNLWMSHookDone) return gNLWMSHook;",
+        "★★ 绝对不 dlopen",
     ),
     (
-        "只看总开关、忽略相机子开关（子开关拨了没反应）",
-        "        blocked = (gEnabled && gBlockCameraSwipe);",
-        "        blocked = gEnabled;",
-        "开关判断用 gEnabled && gBlockCameraSwipe",
+        "★ 签名判据退回 B@: 前缀硬卡（真机上是 B16@: / B@:8 → 静默跳过）",
+        "        if (!NLWLooksLikeNoArgGetter(enc)) {",
+        '        if (!enc || strncmp(enc, "B@:", 3) != 0) {',
+        "★ 签名判据放宽到「无参」而不是「B@: 前缀」",
     ),
     (
-        "★ 顺手把手电筒也禁了（超出需求，多一份误伤）",
-        "        Method m = class_getInstanceMethod(c, @selector(hasCamera));",
-        '        NLWInstallHook(c, @selector(hasFlashlight), (IMP)NLWHasCamera, NULL, "B@:");\n'
-        "        Method m = class_getInstanceMethod(c, @selector(hasCamera));",
-        "没有顺手禁掉手电筒",
-    ),
-    (
-        "hook 目标类写错（返回 NO 也管不到相机）",
-        'NSClassFromString(@"CSQuickActionsViewController")',
-        'NSClassFromString(@"CSLockScreenSettings")',
-        "hook 目标类精确为 CSQuickActionsViewController",
-    ),
-    (
-        "安装函数写了但 NLWInit 里没调用（永远不生效）",
-        "        NLWInstallHasCameraHook();\n",
-        "",
-        "在 NLWInit 里真正调用了安装函数",
-    ),
-    (
-        "orig 判空被删（orig 为 NULL 时调空指针 = 必崩）",
-        "        if (gOrigHasCamera) {\n"
-        "            return ((BOOL (*)(id, SEL))gOrigHasCamera)(self, _cmd);\n"
-        "        }\n"
-        "        return YES;",
-        "        return ((BOOL (*)(id, SEL))gOrigHasCamera)(self, _cmd);",
-        "orig 指针存在且有判空",
-    ),
-    (
-        "★ 只改一处选择子（另一处仍 hook 别的方法，日志还会显示已装上）",
-        "@selector(hasCamera), (IMP)NLWHasCamera,",
-        "@selector(hasFlashlight), (IMP)NLWHasCamera,",
-        "hook 选择子为 hasCamera",
-    ),
-    (
-        "去掉 if (!m) 判空（类在但方法不在时拿 NULL Method 继续走）",
-        "        if (!m) {\n            NLWDiagAdd(@\"[hook] -hasCamera 不存在 → 跳过\");\n            return NO;\n        }",
-        "        if (NO) {\n            NLWDiagAdd(@\"[hook] -hasCamera 不存在 → 跳过\");\n            return NO;\n        }",
-        "类/方法不存在时干净跳过",
-    ),
-    (
-        "整个安装函数被删（相机入口完全没被动过）",
-        "static BOOL NLWInstallHasCameraHook(void)",
-        "static BOOL NLWInstallHasCameraHookRemoved(void)",
-        "有 hasCamera hook 安装函数",
-    ),
-
-    # ------------------------------------------------------------------
-    # 1.8-1：lockScreenCameraSupported（真正管住左滑的那一层）
-    # ★ 这一组每条都对应一个「静默失效」的真实形态：
-    #   装上去了、日志还显示成功，但功能没生效 —— 最难排查的那一类。
-    # ------------------------------------------------------------------
-    (
-        "★ 只探测实例方法（若它其实是类方法，装上等于没装，且日志显示成功）",
-        "        Method mc = class_getClassMethod(c, sel);",
-        "        Method mc = NULL;",
-        "同时探测实例方法与类方法",
-    ),
-    (
-        "★ 类方法装到类本身而不是元类（等于没装，日志照样写已装上）",
-        "            Class meta = object_getClass(c);\n"
-        "            const char *enc = method_getTypeEncoding(mc);",
-        "            Class meta = c;\n"
-        "            const char *enc = method_getTypeEncoding(mc);",
-        "类方法走 object_getClass 取元类再装",
-    ),
-    (
-        "★ 实例与类方法共用同一个 orig（转发到另一张方法表的原实现）",
-        "static IMP gOrigLSCamMeta = NULL;    // 类方法原实现",
-        "static IMP gOrigLSCamDummy = NULL;   // 类方法原实现",
-        "实例与类方法各有自己的 orig 变量",
-    ),
-    (
-        "★ 类方法 hook 体错用了实例方法的 orig",
-        '    return NLWLSCamBody(self, _cmd, gOrigLSCamMeta, "meta");',
-        '    return NLWLSCamBody(self, _cmd, gOrigLSCamInst, "meta");',
-        "两个 hook 体分别引用各自的 orig",
-    ),
-    (
-        "★ 其中一条路径只收 B@:（真实签名是 c@: 时被误跳过）",
-        "            const char *enc = method_getTypeEncoding(mi);\n"
-        "            if (enc && (strncmp(enc, \"B@:\", 3) == 0 ||\n"
-        "                        strncmp(enc, \"c@:\", 3) == 0)) {",
-        "            const char *enc = method_getTypeEncoding(mi);\n"
-        "            if (enc && (strncmp(enc, \"B@:\", 3) == 0)) {",
-        "签名校验接受 B@: 与 c@:",
-    ),
-    (
-        "★ 安装时写死编码（真实签名不同则造出签名不符的方法）",
-        "                if (NLWInstallHook(c, sel, (IMP)NLWLSCamInst, &o, enc)) {",
-        '                if (NLWInstallHook(c, sel, (IMP)NLWLSCamInst, &o, "B@:")) {',
-        "用真实 enc 安装（不写死 B@:）",
-    ),
-    (
-        "hook 体只看总开关（相机子开关拨了没反应）",
-        "static BOOL NLWLSCamBody(id self, SEL _cmd, IMP orig, const char *kind)\n"
-        "{\n"
-        "    BOOL blocked = NO;\n"
-        "    @try {\n"
-        "        blocked = (gEnabled && gBlockCameraSwipe);\n",
-        "static BOOL NLWLSCamBody(id self, SEL _cmd, IMP orig, const char *kind)\n"
-        "{\n"
-        "    BOOL blocked = NO;\n"
-        "    @try {\n"
-        "        blocked = gEnabled;\n",
-        "hook 体：两个开关都要尊重",
-    ),
-    (
-        "★ 开关关闭时不转发原实现（锁屏相机永久消失，开关变假）",
-        "    if (!blocked) {\n"
-        "        if (orig) {\n"
-        "            return ((BOOL (*)(id, SEL))orig)(self, _cmd);",
-        "    if (!blocked) {\n"
-        "        if (orig) {\n"
-        "            return YES;",
-        "hook 体：开关关着就转发原实现",
-    ),
-    (
-        "★ orig 判空被删（orig 为 NULL 时调空指针 = 必崩）",
-        "        if (orig) {\n"
-        "            return ((BOOL (*)(id, SEL))orig)(self, _cmd);",
-        "        if (YES) {\n"
-        "            return ((BOOL (*)(id, SEL))orig)(self, _cmd);",
-        "hook 体：orig 为空时保守放行",
-    ),
-    (
-        "hook 体参数个数写错（与 B@: 不符即崩）",
-        "static BOOL NLWLSCamInst(id self, SEL _cmd)",
-        "static BOOL NLWLSCamInst(id self, SEL _cmd, id extra)",
-        "hook 体是两参无参 getter 原型",
-    ),
-    (
-        "★ 全类扫描改成无条件执行（每次开机白烧几十毫秒，且含 IO）",
-        "        if (!gotInst && !gotMeta) {\n"
-        '            NLWDiagAdd(@"[hook] -lockScreenCameraSupported 未装成 → 开始找真正宿主");\n'
-        '            NLWScanForMethod("lockScreenCameraSupported");\n'
-        "            return NO;\n"
-        "        }",
-        '        NLWScanForMethod("lockScreenCameraSupported");\n'
-        "        if (!gotInst && !gotMeta) {\n"
-        '            NLWDiagAdd(@"[hook] -lockScreenCameraSupported 未装成 → 开始找真正宿主");\n'
-        "            return NO;\n"
-        "        }",
-        "全类扫描只在「没装成」时触发",
-    ),
-    (
-        "★ 方法不存在也硬上（本项目最高等级缺陷：崩宿主）",
-        "        if (!gotInst && !gotMeta) {",
+        "MSHook 失败就放弃，不回退自实现（少一条兜底路径）",
+        "        IMP o = NULL;\n"
+        "        if (NLWInstallHook(cls, sel, newImp, &o, enc)) {",
+        "        IMP o = NULL;\n"
         "        if (NO) {",
-        "方法/类不存在时干净跳过",
+        "MSHook 失败时回退到自实现",
     ),
     (
-        "★ 目标类写成别的类（hook 不到真正宿主，功能全废）",
-        'NSClassFromString(@"SpringBoard")',
-        'NSClassFromString(@"SBHomeScreenController")',
-        "目标类精确为 SpringBoard",
+        "★ 三个 orig 共用一个变量（转发到另一张方法表的原实现）",
+        "static IMP        gOrigLSCamMeta2    = NULL;   // -lockScreenCameraSupported 类",
+        "static IMP        gOrigLSCamDummy    = NULL;   // 已移除",
+        "三个 orig 各自独立",
     ),
     (
-        "★ 选择子名写错（hook 到不存在的方法，静默失败）",
-        "        SEL sel = @selector(lockScreenCameraSupported);",
-        "        SEL sel = @selector(lockScreenCameraAvailable);",
-        "选择子确实是 lockScreenCameraSupported",
+        "★ 相机按钮 hook 错用了手电筒的开关（拨一个动两个）",
+        "    NLW_CAM_HOOK_BODY(gBlockCameraButton, gOrigHasCameraBtn,",
+        "    NLW_CAM_HOOK_BODY(gBlockFlashlight, gOrigHasCameraBtn,",
+        "三个 hook 体分别引用自己的 orig 与自己的开关",
     ),
     (
-        "安装函数改名（等于整段被删）",
-        "static BOOL NLWInstallLSCamHook(void)",
-        "static BOOL NLWInstallLSCamHookRemoved(void)",
-        "有 lockScreenCameraSupported 安装函数",
+        "★ hook 宏里关掉开关也不转发（功能永久消失，开关变假）",
+        "if (ORIG) return ((BOOL (*)(id, SEL))(ORIG))(self, _cmd);",
+        "if (YES) return YES;",
+        "hook 宏：开关关着就转发原实现",
     ),
     (
-        "★ 装了但 NLWInit 里没调用（1.8-1 等于没改）",
-        "        NLWInstallLSCamHook();\n",
+        "★ hook 宏里不判 orig 空值（orig 丢了就调空指针 = 崩宿主）",
+        "if (ORIG) return ((BOOL (*)(id, SEL))(ORIG))(self, _cmd);",
+        "return ((BOOL (*)(id, SEL))(ORIG))(self, _cmd);",
+        "hook 宏：orig 为空时保守放行",
+    ),
+    (
+        "装配函数改名（等于整段被删）",
+        "static void NLWInstallCameraTriple(void)",
+        "static void NLWInstallCameraTripleRemoved(void)",
+        "有相机三件套装配函数",
+    ),
+    (
+        "★ 装了但 NLWInit 里没调用（1.9-1 等于没改）",
+        "        NLWInstallCameraTriple();\n",
         "",
-        "在 NLWInit 里真正调用了 LSCam 安装函数",
+        "在 NLWInit 里真正调用了装配函数",
     ),
     (
-        "★ 为了「省一层」把 hasCamera 删掉（按钮会回来）",
-        "        NLWInstallHasCameraHook();\n",
+        "★ 宿主类写错（hook 不到真正宿主，功能全废）",
+        'NSClassFromString(@"CSQuickActionsViewController")',
+        'NSClassFromString(@"CSQuickActionControl")',
+        "两个宿主类都精确",
+    ),
+    (
+        "★ 少 hook 一个方法（少一项功能）",
+        "            if (NLWInstallBoolGetterHook(cs, @selector(hasFlashlight),",
+        "            if (NLWInstallBoolGetterHook(cs, @selector(hasFlashlightOff),",
+        "三个选择子全部出现",
+    ),
+    (
+        "★ 开关变量改名（设置页那一项拨了没反应）",
+        "static BOOL gBlockFlashlight   = YES;",
+        "static BOOL gBlockFlashlightX  = YES;",
+        "三个开关变量都有定义",
+    ),
+    (
+        "★ NLWLoadSwitches 不读新开关（永远是默认值）",
+        "    gBlockFlashlight   = NLWReadBool(NLWBlockFlashKey,  YES);",
         "",
-        "hasCamera 与 lockScreenCameraSupported 两层都在",
+        "NLWLoadSwitches 真的读了三个相机开关",
+    ),
+    (
+        "★ 把旧安装函数加回来（重复 hook 同一方法）",
+        "static void NLWInstallCameraTriple(void)",
+        "static void NLWInstallHasCameraHook(void);\n"
+        "static void NLWInstallCameraTriple(void)",
+        "旧的两套相机安装函数已彻底移除",
     ),
 ]
 

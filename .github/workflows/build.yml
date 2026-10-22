@@ -66,7 +66,17 @@ env:
   #            → 0x7f04 也是 mov w0,#0; ret
   #   本版加上第三个 hook，实例方法与类方法都探测（不确定它挂在哪张表上），
   #   装不上时扫描全类把真正的宿主写进日志 —— 下次不用再猜。
-  VERSION: 1.8-1
+  # ★ 1.9-1：**第六次修复，换掉整条实现路径**。1.8-1 用户实测仍不生效，
+  #   而同一台机器上 com.yccameraflight 1.1 实测生效。两份产物功能已等价，
+  #   差别只在实现：它用 MSHookMessageEx 且**完全不校验签名**，
+  #   我用自实现 hook + 严格 `B@:`/`c@:` 前缀匹配 ——
+  #   真机编码常是 `B16@:` / `B@:8`，被判成"签名异常"而静默跳过。
+  #   本版照抄它的机制：MSHookMessageEx 优先（dlsym 取符号，绝不 dlopen）、
+  #   签名判据放宽为「无参即可」、失败回退自实现、三条路径都写日志。
+  #   并且按用户要求拆成三个独立开关：
+  #     BlockFlashlight → hasFlashlight / BlockCameraButton → hasCamera /
+  #     BlockCameraSwipe → lockScreenCameraSupported
+  VERSION: 1.9-1
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 

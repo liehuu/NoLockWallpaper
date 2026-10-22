@@ -106,7 +106,12 @@
 
 static NSString *const NLWPrefsDomain        = @"com.liehuu.nolockwallpaper";
 static NSString *const NLWEnabledKey         = @"Enabled";
+/// 禁左滑进相机（映射 SpringBoard -lockScreenCameraSupported）
 static NSString *const NLWBlockCameraKey     = @"BlockCameraSwipe";
+/// 1.9-1：禁锁屏相机按钮（映射 CSQuickActionsViewController -hasCamera）
+static NSString *const NLWBlockCamBtnKey     = @"BlockCameraButton";
+/// 1.9-1：禁锁屏手电筒（映射 CSQuickActionsViewController -hasFlashlight）
+static NSString *const NLWBlockFlashKey      = @"BlockFlashlight";
 /// 与 Root.plist 里 PSSwitchCell 的 PostNotification 必须**完全一致**。
 /// 不一致 = 改了开关没反应，且看不出原因（这类问题排查成本极高）。
 static NSString *const NLWChangedNotification = @"com.liehuu.nolockwallpaper/changed";
@@ -116,6 +121,10 @@ static NSString *const NLWChangedNotification = @"com.liehuu.nolockwallpaper/cha
 static BOOL gEnabled          = YES;
 /// 禁左滑进相机的子开关（用户可能只想禁长按、保留相机）。
 static BOOL gBlockCameraSwipe = YES;
+/// 1.9-1：禁锁屏相机按钮（只影响按钮，不影响左滑）。
+static BOOL gBlockCameraButton = YES;
+/// 1.9-1：禁锁屏手电筒。
+static BOOL gBlockFlashlight   = YES;
 
 static BOOL NLWReadBool(NSString *key, BOOL fallback)
 {
@@ -141,8 +150,10 @@ static BOOL NLWReadBool(NSString *key, BOOL fallback)
 /// 那会被当成「装坏了」，排查成本极高。
 static void NLWLoadSwitches(void)
 {
-    gEnabled          = NLWReadBool(NLWEnabledKey,     YES);
-    gBlockCameraSwipe = NLWReadBool(NLWBlockCameraKey, YES);
+    gEnabled           = NLWReadBool(NLWEnabledKey,     YES);
+    gBlockCameraSwipe  = NLWReadBool(NLWBlockCameraKey, YES);
+    gBlockCameraButton = NLWReadBool(NLWBlockCamBtnKey, YES);
+    gBlockFlashlight   = NLWReadBool(NLWBlockFlashKey,  YES);
 }
 
 // ============================================================================
@@ -1174,393 +1185,285 @@ static BOOL NLWInstallHook(Class cls, SEL sel, IMP newImp, IMP *origOut,
 }
 
 // ============================================================================
-//  七之二、1.7-1：真正的解法 —— hook `-hasCamera`，让系统认为没有相机
+//  七之四、1.9-1：照抄「已实测生效」的插件，一个方法一个开关
 // ============================================================================
 //
-// ★★★ 这一版换了思路：不再跟手势较劲，而是直接告诉系统「这台设备没有相机」。
+// ★★★ 为什么整段重写，而不是继续修 1.7-1 / 1.8-1
 //
-//   前四轮全在找「哪个手势触发相机」：
-//     1.3-1  判 edge pan        → 日志里 edges 无 8，判据落空
-//     1.4-1  判手势自述        → 108 条里 camera 出现 0 次
-//     1.5-1  判 swipe 方向      → dir 全是 -，仍然 0 次
-//     1.6-1  拦 setEnabled:     → **8 次 blocked=1，相机照进**
-//   1.6-1 的日志是最有价值的一份：它证明拦截**确实生效了**，
-//   而相机照样打开 —— 所以「相机入口是某个我能拦住的手势」这个假设
-//   本身就不成立，再往下微调判据也只是换个地方落空。
+//   1.7-1（只 hook hasCamera）→ 用户实测：左滑照进
+//   1.8-1（+ lockScreenCameraSupported）→ 用户实测：**还是不生效**
+//   而同一台机器上 com.yccameraflight 1.1 **实测生效**。
 //
-// ★ 答案来自一份现成插件（com.cydia.love.xtyh 1.7，2026-10-22 逆向分析）：
-//   它的「禁用锁屏左滑相机」只做了一件事 ——
+//   两份产物在功能上已经等价（都 hook 这三个方法），唯一差别在两处实现细节：
 //
-//       Class c = objc_getClass("CSQuickActionsViewController");
-//       MSHookMessageEx(c, @selector(hasFlashlight), ret_NO, &orig);
-//       MSHookMessageEx(c, @selector(hasCamera),     ret_NO, &orig);
+//     ① 它用 **MSHookMessageEx**（CydiaSubstrate），我用自实现的
+//        class_addMethod / method_setImplementation；
+//     ② 它 **完全不校验签名**，我要求 enc 必须以 `B@:` 或 `c@:` 开头。
 //
-//   反汇编证据（systemyh.dylib，arm64 切片）：
-//     0x6fd4  adr x0, #0x7a54      → 字符串 "CSQuickActionsViewController"
-//     0x6fdc  bl  objc_getClass
-//     0x6fe0  mov x19, x0          → 类存起来，后面两次 hook 共用
-//     0x6fe8  ldr x1, #0xc070      → selref "hasFlashlight"
-//     0x6ff4  adr x16, #0x736c     → hook 函数
-//     0x700c  ldr x1, #0xc068      → selref "hasCamera"
-//     0x7018  adr x16, #0x7374     → hook 函数
-//     0x736c  mov w0, #0 ; ret     ← hasFlashlight 的 hook：直接返回 NO
-//     0x7374  mov w0, #0 ; ret     ← hasCamera     的 hook：直接返回 NO
+//   ② 极可能就是失败点：`method_getTypeEncoding` 在真机上常返回
+//   `B16@:`、`B@:8` 这类带偏移/长度修饰的形式，`strncmp(enc,"B@:",3)`
+//   会直接判不通过 → 静静跳过 → 日志里只有一行"签名异常"，功能零效果。
+//   而插件不做这个判断，所以它能装上。
 //
-//   —— 没有 hook 任何手势，就一句「返回 NO」。
+//   ★ 教训：**防御性检查如果比被检查对象更严格，它就从保护变成了障碍。**
+//     签名校验的本意是防崩，但"无参 getter"这一类根本不需要那么严 ——
+//     见下面 NLWLooksLikeNoArgGetter 的取舍说明。
 //
-// ★ 当时以为「返回 NO 能连左滑一起禁掉」的理由（**已被 1.8-1 实测推翻**）：
-//   `CSQuickActionsViewController` 是锁屏底部快捷操作（手电筒/相机）的控制器，
-//   于是推断 CoverSheet 在决定「启用哪些相机入口」时查的就是 `-hasCamera`，
-//   返回 NO ⇒ 系统认为设备没有相机 ⇒ 相机页不加载、左滑无从触发。
-//   ★ 实机结果：只让按钮消失，**左滑照样进相机**。
-//   说明 `-hasCamera` 只管「按钮显不显示」，不参与「相机页要不要挂载」。
-//   真正管后者的是 SpringBoard 的 `-lockScreenCameraSupported`（见「七之三」）。
-//   这段推理保留在此，是因为它记录了「同一功能有多层判定」这个坑：
-//   关掉下游（按钮层）永远拦不住上游（页面加载层）。
-//   前五轮反复失败，本质都是「盯着一个层死磕」。
+// ★★★ 本版做法：与插件同构，只多三个开关
 //
-// ★ 代价（必须在交付说明里写清楚）：
-//   锁屏右下角的**相机按钮也会一起消失**。按钮和手势共用这个开关，
-//   没有「只禁手势、保留按钮」的子选项 —— 去 hook 手势本身做不到，
-//   前四轮已经用实机日志证明过了。
+//   三个 hook 目标、三个返回值、三条装配路径，全部照抄它的反汇编：
 //
-// ★ 为什么这个 hook 是四版里最安全的：
-//   ① `-hasCamera` 是**无参 getter**，返回 BOOL，签名 `B@:` 无歧义
-//      （对比 hook 私有手势：类名、是否存在、参数个数全靠猜）；
-//   ② 类不存在 → 干净跳过（iOS 版本差异）；
-//   ③ 方法签名不符 → 干净跳过；
-//   ④ 开关关闭时**转发原实现**，不改状态、不留恢复负担；
-//   ⑤ 全程 @try，异常绝不出线程。
+//     CSQuickActionsViewController -hasFlashlight              → NO
+//     CSQuickActionsViewController -hasCamera                  → NO
+//     SpringBoard                  -lockScreenCameraSupported  → NO
+//
+//   反汇编证据（com.yccameraflight 1.1，arm64，__text @0x7e6c 共 160 字节）：
+//     0x7e78 adr x0, "CSQuickActionsViewController" ; bl objc_getClass
+//     0x7e8c ldr x1, selref hasCamera            → 0x7ef4 mov w0,#0; ret
+//     0x7ea8 ldr x1, selref hasFlashlight        → 0x7efc mov w0,#0; ret
+//     0x7ec4 adr x0, "SpringBoard"               ; bl objc_getClass
+//     0x7ed4 ldr x1, selref lockScreenCameraSupported → 0x7f04 mov w0,#0; ret
+//   旁证：__objc_selrefs 恰好 3 项、尾部恰好 3 个 mov w0,#0; ret。
+//
+// ★ 三个开关与三个 hook 的对应关系（用户 2026-10-22 明确要求）：
+//
+//     BlockFlashlight     → -hasFlashlight             禁锁屏手电筒
+//     BlockCameraButton   → -hasCamera                 禁锁屏相机按钮
+//     BlockCameraSwipe    → -lockScreenCameraSupported 禁左滑进相机
+//
+//   ★ 必须说清的一处耦合：`lockScreenCameraSupported` 返回 NO 会让系统
+//     认定「本机不支持锁屏相机」，于是**相机页不挂载、按钮也不显示**。
+//     所以「禁左滑」打开时，按钮一定跟着消失 —— 这不是 bug，是同一个开关。
+//     反过来「禁按钮」只影响按钮，不影响左滑。三个开关里只有这一对是单向牵连。
+//
+// ★ 装配顺序（重要）：
+//   ① 优先 `MSHookMessageEx` —— 与实测生效的插件完全同一条路径；
+//   ② 拿不到符号或失败 → 回退到自实现的 NLWInstallHook；
+//   ③ 两条都失败 → 写日志说明原因，绝不硬上。
+//   ★ 用 `dlsym(RTLD_DEFAULT, ...)` 取符号，**不 dlopen 任何库** ——
+//     项目红线：注入进程里 dlopen 一个「可能已经在运行」的库，
+//     会加载出第二份 Substrate，双引擎改同一张方法表 = 必崩。
 
-static IMP gOrigHasCamera = NULL;
-static NSUInteger gHasCameraCalls = 0;
+typedef void (*NLWMSHookFn)(Class, SEL, IMP, IMP *);
 
-/// hook 体：开关关着一律转发原实现；只在该禁的时候返回 NO。
-///
-/// ★ 为什么不用「关开关时把 IMP 改回去」：
-///   改 IMP 有时序问题（谁来改、何时改），一旦漏恢复，用户关掉开关后
-///   相机仍然消失 —— 属于「开关是假的」那类缺陷，而且极难排查。
-///   这里每次调用都看一遍开关，代价是两次 BOOL 比较，但绝不留残留状态。
-static BOOL NLWHasCamera(id self, SEL _cmd)
+static NLWMSHookFn gNLWMSHook    = NULL;
+static BOOL        gNLWMSHookDone = NO;
+
+/// 取 MSHookMessageEx。查的是**已加载镜像**里的符号，不加载任何新库。
+static NLWMSHookFn NLWGetMSHook(void)
 {
-    BOOL blocked = NO;
+    if (gNLWMSHookDone) return gNLWMSHook;
+    gNLWMSHookDone = YES;
     @try {
-        blocked = (gEnabled && gBlockCameraSwipe);
-    } @catch (NSException *e) { }
-
-    if (!blocked) {
-        if (gOrigHasCamera) {
-            return ((BOOL (*)(id, SEL))gOrigHasCamera)(self, _cmd);
-        }
-        return YES;      // 没拿到 orig（理论上不会走到）→ 保守放行
-    }
-
-    // 诊断：前 8 次调用留痕。用来看「系统到底在什么时机查这个属性」——
-    // 如果屏幕上相机确实没了，这 8 条就是成功证据；
-    // 如果相机还在，说明这个属性管不到手势，日志会显示它被查了但没起作用。
-    @try {
-        if (gHasCameraCalls < 8) {
-            gHasCameraCalls++;
-            NLWDiagAdd([NSString stringWithFormat:
-                @"[hasCamera#%lu] -> NO  cls=%s",
-                (unsigned long)gHasCameraCalls,
-                class_getName(object_getClass(self))]);
-        }
-    } @catch (NSException *e) { }
-
-    return NO;
-}
-
-/// 安装 `-hasCamera` 的 hook。返回是否装上。
-static BOOL NLWInstallHasCameraHook(void)
-{
-    @try {
-        Class c = NSClassFromString(@"CSQuickActionsViewController");
-        if (!c) {
-            NLWDiagAdd(@"[hook] CSQuickActionsViewController 不存在 → 跳过");
-            return NO;
-        }
-
-        Method m = class_getInstanceMethod(c, @selector(hasCamera));
-        if (!m) {
-            NLWDiagAdd(@"[hook] -hasCamera 不存在 → 跳过");
-            return NO;
-        }
-
-        // ★ 签名校验：必须是无参实例方法（`B@:` 或 `c@:`）。
-        //   真出现带参数的版本就跳过 —— 「签名不符干净跳过」是项目铁律：
-        //   硬上等于用错的参数个数去调原实现，那是必崩。
-        const char *enc = method_getTypeEncoding(m);
-        BOOL encOK = (enc && (strncmp(enc, "B@:", 3) == 0 ||
-                              strncmp(enc, "c@:", 3) == 0));
-        if (!encOK) {
-            NLWDiagAdd([NSString stringWithFormat:
-                @"[hook] -hasCamera 签名异常 enc=%s → 跳过",
-                enc ? enc : "(null)"]);
-            return NO;
-        }
-
-        IMP o = NULL;
-        // ★ 传真实 enc 而不是写死 "B@:"：万一哪天变成 c@:，
-        //   class_addMethod 用错编码会造出一个签名不符的方法。
-        if (!NLWInstallHook(c, @selector(hasCamera), (IMP)NLWHasCamera,
-                            &o, enc)) {
-            NLWDiagAdd(@"[hook] -hasCamera 安装失败 → 跳过");
-            return NO;
-        }
-        gOrigHasCamera = o;
+        gNLWMSHook = (NLWMSHookFn)dlsym(RTLD_DEFAULT, "MSHookMessageEx");
         NLWDiagAdd([NSString stringWithFormat:
-            @"[hook] -hasCamera 已装上 enc=%s orig=%p",
-            enc, (void *)o]);
-        return YES;
+            @"[ms] MSHookMessageEx=%p", (void *)gNLWMSHook]);
     } @catch (NSException *e) { }
-    return NO;
+    return gNLWMSHook;
 }
 
-// ============================================================================
-//  七之三、1.8-1：补上真正管住「左滑」的那一层
-//          —— SpringBoard / -lockScreenCameraSupported
-// ============================================================================
-//
-// ★ 1.7-1 只 hook 了 `-hasCamera`，用户实机反馈：**左滑照样进相机**。
-//   于是又解开第二份现成插件（com.yccameraflight 1.1，
-//   "隐藏相机手电筒，禁用左滑"），答案很干脆 —— 它 hook 的**不止 hasCamera**：
-//
-//       Class cs = objc_getClass("CSQuickActionsViewController");
-//       MSHookMessageEx(cs, @selector(hasCamera),     ret_NO, &o0);
-//       MSHookMessageEx(cs, @selector(hasFlashlight), ret_NO, &o1);
-//       Class sb = objc_getClass("SpringBoard");
-//       MSHookMessageEx(sb, @selector(lockScreenCameraSupported), ret_NO, &o2);
-//
-//   反汇编证据（隐藏相机手电筒.dylib，arm64 切片，__text @0x7e6c，共 160 字节）：
-//     0x7e78  adr  x0, #0x7f54     → 字符串 "CSQuickActionsViewController"
-//     0x7e80  bl   objc_getClass
-//     0x7e8c  ldr  x1, #0xc010     → selref "hasCamera"
-//     0x7e90  adr  x2, #0x7ef4     → hook 体：mov w0,#0 ; ret
-//     0x7ea8  ldr  x1, #0xc018     → selref "hasFlashlight"
-//     0x7eac  adr  x2, #0x7efc     → hook 体：mov w0,#0 ; ret
-//     0x7ec4  adr  x0, #0x7f71     → 字符串 "SpringBoard"
-//     0x7ecc  bl   objc_getClass
-//     0x7ed4  ldr  x1, #0xc020     → selref "lockScreenCameraSupported"
-//     0x7ed8  adr  x2, #0x7f04     → hook 体：mov w0,#0 ; ret
-//
-//   旁证：它的 `__objc_selrefs` 恰好 3 项、`__objc_methname` 恰好 3 个选择子、
-//   代码尾部恰好 3 个「mov w0,#0; ret」—— 它真的只做这三件事，没碰任何手势。
-//
-// ★ 为什么只加 hasCamera 不够（这就是 1.7-1 失败的机制）：
-//   `-hasCamera` 属于 **CSQuickActionsViewController**，那是锁屏底部
-//   「手电筒/相机」快捷按钮的控制器 —— 它管的是**按钮显不显示**。
-//   而「左滑能不能进相机」的判定在更上层：SpringBoard 那边先问
-//   `-lockScreenCameraSupported`（这台设备是否支持锁屏相机），得到 YES
-//   才会去挂载相机页、才会响应左滑。
-//   所以 1.7-1 的真实效果是「按钮可能没了，左滑照进」——与用户实测吻合。
-//   ★ 教训：一个功能有多个判定层时，把最靠上的那个开关关掉才叫关掉；
-//     只关下游（按钮层）永远拦不住上游（页面加载层）。
-//
-// ★ 这一层为什么也安全（对照「崩宿主自查表」逐条过）：
-//   ① 无参 getter，返回 BOOL，签名 `B@:`（个别版本 `c@:`），无歧义；
-//   ② **同时探测实例方法与类方法** —— 不知道它挂在哪张方法表上，两种都试，
-//      装上哪个记哪个，都不存在就干净跳过（绝不硬上）；
-//   ③ orig 一定存下来，且 hook 体内 orig 为空时**保守返回 YES**（放行），
-//      绝不出现「方法被换掉而 orig 没存下 → 下次调空指针」；
-//   ④ 开关关着一律转发 orig，不改状态、不留恢复负担；
-//   ⑤ 全程 @try，异常绝不出线程；构造器里再包一层。
-//
-// ★ 代价（比 1.7-1 大一档，必须写进交付说明）：
-//   锁屏的相机入口整体不可用 —— 按钮 + 左滑都没了。
-//   这与参考插件的行为一致（它的说明就写着「隐藏相机手电筒，禁用左滑」）。
-//   没有「只禁左滑、保留按钮」的子选项，因为按钮和左滑共用同一批判定。
-
-static IMP gOrigLSCamInst = NULL;    // 实例方法原实现
-static IMP gOrigLSCamMeta = NULL;    // 类方法原实现
-static NSUInteger gLSCamCalls = 0;
-
-/// 两个 hook 体共用的逻辑。`orig` 由调用方传入（对应实例/类两张表）。
-static BOOL NLWLSCamBody(id self, SEL _cmd, IMP orig, const char *kind)
-{
-    BOOL blocked = NO;
-    @try {
-        blocked = (gEnabled && gBlockCameraSwipe);
-    } @catch (NSException *e) { }
-
-    if (!blocked) {
-        if (orig) {
-            return ((BOOL (*)(id, SEL))orig)(self, _cmd);
-        }
-        // 理论到不了这里；真到了就放行 —— 放行最多是「功能没生效」，
-        // 硬返回 NO 也只是少个开关，但「调空指针」会崩宿主，两害相权取其轻。
-        return YES;
-    }
-
-    @try {
-        if (gLSCamCalls < 8) {
-            gLSCamCalls++;
-            NLWDiagAdd([NSString stringWithFormat:
-                @"[lscam#%lu] -> NO (%s) cls=%s",
-                (unsigned long)gLSCamCalls, kind,
-                class_getName(object_getClass(self))]);
-        }
-    } @catch (NSException *e) { }
-
-    return NO;
-}
-
-static BOOL NLWLSCamInst(id self, SEL _cmd)
-{
-    return NLWLSCamBody(self, _cmd, gOrigLSCamInst, "inst");
-}
-
-static BOOL NLWLSCamMeta(id self, SEL _cmd)
-{
-    return NLWLSCamBody(self, _cmd, gOrigLSCamMeta, "meta");
-}
-
-/// 万一 SpringBoard 上没有这个方法，就把所有类里带这个名字的方法找出来写进日志。
+/// 判断编码是否「无参、整型/布尔返回」。
 ///
-/// ★ 为什么值得写：这一轮的教训就是「不知道宿主类就只能猜」。
-///   这个扫描只在**没装成**时跑一次，结果直接写进日志 ——
-///   下次拿到日志就知道该 hook 谁，不用再耗一轮试错。
-/// ★ 只在启动期执行，不在任何热路径上；每个类都包 @try，异常不外泄。
-static void NLWScanForMethod(const char *selName)
+/// ★ 这里刻意放宽，与 1.7/1.8 的 `strncmp(enc,"B@:",3)` 不同 ——
+///   真机上同一个无参 getter 的编码可能是 `B@:`、`B16@:`、`B@:8`、
+///   `c@:` …… 前缀严格匹配会把多数情况误判成"签名异常"而跳过。
+///   实际需要防的只有一种：**方法带参数**（那才可能出现参数错位）。
+///   所以判据改成「冒号之后只有数字和所有权修饰符」。
+/// ★ 返回值放宽到任何整型（B/c/i/s/q）：arm64 上都用 w0/x0 返回，
+///   `return NO` 写 w0=0 对所有整型返回类型都成立。
+static BOOL NLWLooksLikeNoArgGetter(const char *enc)
 {
+    if (!enc || !*enc) return NO;
+    const char *colon = strchr(enc, ':');
+    if (!colon) return NO;               // 没有 `:` 就不是方法编码
+    for (const char *p = colon + 1; *p; p++) {
+        if (*p >= '0' && *p <= '9') continue;   // 参数帧长度，如 B16@:
+        if (strchr("rnNoORV", *p)) continue;    // 所有权修饰符
+        return NO;                              // 出现类型字母 = 有参数
+    }
+    return YES;
+}
+
+/// 通用「无参 bool getter」hook 安装器。
+/// 返回是否装上；orig 通过 origOut 带出。
+static BOOL NLWInstallBoolGetterHook(Class cls, SEL sel, IMP newImp,
+                                    IMP *origOut, const char *tag)
+{
+    if (origOut) *origOut = NULL;
     @try {
-        int total = objc_getClassList(NULL, 0);
-        if (total <= 0) return;
+        if (!cls || !sel || !newImp) return NO;
 
-        // ★ 上限保护：这段跑在 SpringBoard 启动期的主线程上，
-        //   正常设备约 5k~8k 个类，几十毫秒即可跑完。
-        //   真遇到异常环境（类数爆到几万）宁可不扫 ——
-        //   启动被拖慢的后果比「少一条诊断日志」严重得多。
-        if (total > 30000) {
+        // ★ 先确认方法真的存在：对不存在的方法调用 MSHookMessageEx
+        //   会「成功」地造出一个新方法，之后没人会调它 —— 属于静默失败。
+        Method m = class_getInstanceMethod(cls, sel);
+        if (!m) {
             NLWDiagAdd([NSString stringWithFormat:
-                @"[scan] 类数 %d 过多 → 跳过扫描（避免拖慢启动）", total]);
-            return;
+                @"[hook] %s 不存在（类 %s）", tag, class_getName(cls)]);
+            return NO;
         }
 
-        Class *classes = (Class *)malloc(sizeof(Class) * (size_t)total);
-        if (!classes) return;
-        total = objc_getClassList(classes, total);
+        const char *enc = method_getTypeEncoding(m);
+        if (!NLWLooksLikeNoArgGetter(enc)) {
+            NLWDiagAdd([NSString stringWithFormat:
+                @"[hook] %s 编码像是有参数，跳过 enc=%s",
+                tag, enc ? enc : "(null)"]);
+            return NO;
+        }
 
-        NSMutableArray *hits = [NSMutableArray array];
-        for (int i = 0; i < total && hits.count < 12; i++) {
-            Class c = classes[i];
-            if (!c) continue;
+        // ---- 路径 1：MSHookMessageEx（与实测生效的插件同一条路）----
+        NLWMSHookFn ms = NLWGetMSHook();
+        if (ms) {
+            IMP prev = NULL;
             @try {
-                // 实例方法表
-                unsigned int cnt = 0;
-                Method *ms = class_copyMethodList(c, &cnt);
-                if (ms) {
-                    for (unsigned int k = 0; k < cnt; k++) {
-                        const char *nm = sel_getName(method_getName(ms[k]));
-                        if (nm && strcmp(nm, selName) == 0) {
-                            [hits addObject:[NSString stringWithFormat:
-                                @"%s(inst)", class_getName(c)]];
-                            break;
-                        }
-                    }
-                    free(ms);
-                }
-                // 类方法表
-                Class meta = object_getClass(c);
-                if (meta) {
-                    unsigned int cnt2 = 0;
-                    Method *ms2 = class_copyMethodList(meta, &cnt2);
-                    if (ms2) {
-                        for (unsigned int k = 0; k < cnt2; k++) {
-                            const char *nm = sel_getName(method_getName(ms2[k]));
-                            if (nm && strcmp(nm, selName) == 0) {
-                                [hits addObject:[NSString stringWithFormat:
-                                    @"%s(meta)", class_getName(c)]];
-                                break;
-                            }
-                        }
-                        free(ms2);
-                    }
-                }
-            } @catch (NSException *e) { }
-        }
-        free(classes);
-
-        if (hits.count == 0) {
+                ms(cls, sel, newImp, &prev);
+            } @catch (NSException *e) {
+                prev = NULL;
+            }
+            if (prev) {
+                if (origOut) *origOut = prev;
+                NLWDiagAdd([NSString stringWithFormat:
+                    @"[hook] %s 已装上(ms) enc=%s orig=%p", tag, enc, (void *)prev]);
+                return YES;
+            }
             NLWDiagAdd([NSString stringWithFormat:
-                @"[scan] 全类扫描：没有任何类实现 %s", selName]);
+                @"[hook] %s MSHook 失败，回退自实现", tag]);
         } else {
             NLWDiagAdd([NSString stringWithFormat:
-                @"[scan] 实现 %s 的类：%@", selName,
-                [hits componentsJoinedByString:@", "]]);
+                @"[hook] %s 无 MSHookMessageEx，用自实现", tag]);
         }
+
+        // ---- 路径 2：自实现（1.7-1 用过的那套，作为兜底保留）----
+        IMP o = NULL;
+        if (NLWInstallHook(cls, sel, newImp, &o, enc)) {
+            if (origOut) *origOut = o;
+            NLWDiagAdd([NSString stringWithFormat:
+                @"[hook] %s 已装上(self) enc=%s orig=%p", tag, enc, (void *)o]);
+            return YES;
+        }
+
+        NLWDiagAdd([NSString stringWithFormat:
+            @"[hook] %s 两条路径都失败 enc=%s", tag, enc ? enc : "(null)"]);
+        return NO;
     } @catch (NSException *e) {
-        NLWDiagAdd(@"[scan] 扫描异常（已忽略）");
+        NLWDiagAdd([NSString stringWithFormat:@"[hook] %s 安装异常（已忽略）", tag]);
+        return NO;
     }
 }
 
-/// 安装 `-lockScreenCameraSupported` 的 hook。返回是否装上。
-static BOOL NLWInstallLSCamHook(void)
+// ---- 三个 hook 的原实现与调用计数 ----
+
+static IMP        gOrigHasFlashlight = NULL;   // -hasFlashlight
+static IMP        gOrigHasCameraBtn  = NULL;   // -hasCamera
+static IMP        gOrigLSCamInst2    = NULL;   // -lockScreenCameraSupported 实例
+static IMP        gOrigLSCamMeta2    = NULL;   // -lockScreenCameraSupported 类
+
+static NSUInteger gHintFlashlight = 0;
+static NSUInteger gHintCameraBtn  = 0;
+static NSUInteger gHintLSCam      = 0;
+
+/// 前 6 次命中留痕。★ 只用于「区分没生效和崩了」，不是功能的一部分。
+static void NLWNoteCamHit(NSUInteger *counter, const char *tag)
 {
     @try {
-        Class c = NSClassFromString(@"SpringBoard");
-        if (!c) {
-            NLWDiagAdd(@"[hook] SpringBoard 类不存在 → 跳过");
-            return NO;
+        if (*counter < 6) {
+            (*counter)++;
+            NLWDiagAdd([NSString stringWithFormat:
+                @"[%s#%lu] -> NO", tag, (unsigned long)*counter]);
         }
-
-        SEL sel = @selector(lockScreenCameraSupported);
-        BOOL gotInst = NO, gotMeta = NO;
-
-        Method mi = class_getInstanceMethod(c, sel);
-        Method mc = class_getClassMethod(c, sel);
-
-        // ★ 先把「有没有」记下来，再谈装没装上 ——
-        //   这两件事在日志里必须能分开看，否则又变成猜。
-        NLWDiagAdd([NSString stringWithFormat:
-            @"[hook] SpringBoard 探测 lockScreenCameraSupported inst=%s meta=%s",
-            mi ? "有" : "无", mc ? "有" : "无"]);
-
-        if (mi) {
-            const char *enc = method_getTypeEncoding(mi);
-            if (enc && (strncmp(enc, "B@:", 3) == 0 ||
-                        strncmp(enc, "c@:", 3) == 0)) {
-                IMP o = NULL;
-                if (NLWInstallHook(c, sel, (IMP)NLWLSCamInst, &o, enc)) {
-                    gOrigLSCamInst = o;
-                    gotInst = YES;
-                }
-            } else {
-                NLWDiagAdd([NSString stringWithFormat:
-                    @"[hook] 实例 -lockScreenCameraSupported 签名异常 enc=%s → 不装",
-                    enc ? enc : "(null)"]);
-            }
-        }
-
-        if (mc) {
-            Class meta = object_getClass(c);
-            const char *enc = method_getTypeEncoding(mc);
-            if (meta && enc && (strncmp(enc, "B@:", 3) == 0 ||
-                                strncmp(enc, "c@:", 3) == 0)) {
-                IMP o = NULL;
-                if (NLWInstallHook(meta, sel, (IMP)NLWLSCamMeta, &o, enc)) {
-                    gOrigLSCamMeta = o;
-                    gotMeta = YES;
-                }
-            } else {
-                NLWDiagAdd([NSString stringWithFormat:
-                    @"[hook] 类 +lockScreenCameraSupported 签名异常 enc=%s → 不装",
-                    enc ? enc : "(null)"]);
-            }
-        }
-
-        if (!gotInst && !gotMeta) {
-            NLWDiagAdd(@"[hook] -lockScreenCameraSupported 未装成 → 开始找真正宿主");
-            NLWScanForMethod("lockScreenCameraSupported");
-            return NO;
-        }
-
-        NLWDiagAdd([NSString stringWithFormat:
-            @"[hook] -lockScreenCameraSupported 已装上 inst=%d meta=%d",
-            gotInst ? 1 : 0, gotMeta ? 1 : 0]);
-        return YES;
     } @catch (NSException *e) { }
+}
+
+/// 统一的三段式：关着就转发原实现；该禁就返回 NO；orig 丢了就放行。
+#define NLW_CAM_HOOK_BODY(FLAG, ORIG, TAG, COUNTER)                            \
+    BOOL off = NO;                                                             \
+    @try { off = (gEnabled && (FLAG)); } @catch (NSException *e) { }            \
+    if (!off) {                                                                \
+        if (ORIG) return ((BOOL (*)(id, SEL))(ORIG))(self, _cmd);              \
+        return YES;                                                            \
+    }                                                                          \
+    NLWNoteCamHit(&(COUNTER), TAG);                                            \
     return NO;
+
+static BOOL NLWHookHasFlashlight(id self, SEL _cmd)
+{
+    NLW_CAM_HOOK_BODY(gBlockFlashlight, gOrigHasFlashlight,
+                      "flashlight", gHintFlashlight)
+}
+
+static BOOL NLWHookHasCameraBtn(id self, SEL _cmd)
+{
+    NLW_CAM_HOOK_BODY(gBlockCameraButton, gOrigHasCameraBtn,
+                      "camerabtn", gHintCameraBtn)
+}
+
+static BOOL NLWHookLSCamInst(id self, SEL _cmd)
+{
+    NLW_CAM_HOOK_BODY(gBlockCameraSwipe, gOrigLSCamInst2,
+                      "lscam", gHintLSCam)
+}
+
+static BOOL NLWHookLSCamMeta(id self, SEL _cmd)
+{
+    NLW_CAM_HOOK_BODY(gBlockCameraSwipe, gOrigLSCamMeta2,
+                      "lscam-meta", gHintLSCam)
+}
+
+#undef NLW_CAM_HOOK_BODY
+
+/// 装配三个 hook。任何一个失败都只影响它自己那一项，不影响其它两项。
+static void NLWInstallCameraTriple(void)
+{
+    @try {
+        int okCount = 0;
+
+        // ---- 类 1：CSQuickActionsViewController（手电筒 + 相机按钮）----
+        Class cs = NSClassFromString(@"CSQuickActionsViewController");
+        if (!cs) {
+            NLWDiagAdd(@"[hook] CSQuickActionsViewController 类不存在 → 手电筒/相机按钮无法拦");
+        } else {
+            if (NLWInstallBoolGetterHook(cs, @selector(hasFlashlight),
+                                        (IMP)NLWHookHasFlashlight,
+                                        &gOrigHasFlashlight, "hasFlashlight")) {
+                okCount++;
+            }
+            if (NLWInstallBoolGetterHook(cs, @selector(hasCamera),
+                                        (IMP)NLWHookHasCameraBtn,
+                                        &gOrigHasCameraBtn, "hasCamera")) {
+                okCount++;
+            }
+        }
+
+        // ---- 类 2：SpringBoard（左滑进相机的总闸）----
+        // ★ 实例方法与类方法都试：静态反汇编看不出它挂在哪张表上。
+        //   两个 hook 体分别用各自的 orig，绝不共用 —— 共用会转发到
+        //   另一张方法表的原实现，那是必错。
+        Class sb = NSClassFromString(@"SpringBoard");
+        if (!sb) {
+            NLWDiagAdd(@"[hook] SpringBoard 类不存在 → 左滑无法拦");
+        } else {
+            BOOL gotI = NLWInstallBoolGetterHook(sb,
+                            @selector(lockScreenCameraSupported),
+                            (IMP)NLWHookLSCamInst,
+                            &gOrigLSCamInst2, "lscam(inst)");
+            if (gotI) okCount++;
+            // 实例装上了就不再动元类：同一个选择子两处都装，
+            // 只会让「谁在调」变模糊，没有额外收益。
+            if (!gotI) {
+                Class meta = object_getClass(sb);
+                if (meta && NLWInstallBoolGetterHook(meta,
+                            @selector(lockScreenCameraSupported),
+                            (IMP)NLWHookLSCamMeta,
+                            &gOrigLSCamMeta2, "lscam(meta)")) {
+                    okCount++;
+                }
+            }
+        }
+
+        NLWDiagAdd([NSString stringWithFormat:
+            @"[hook] 相机三件套装配完成：%d/3 装上", okCount]);
+    } @catch (NSException *e) {
+        NLWDiagAdd(@"[hook] 装配异常（已忽略，宿主必须照常启动）");
+    }
 }
 
 // ============================================================================
@@ -1863,7 +1766,7 @@ __attribute__((constructor)) static void NLWInit(void)
         //   所以它已经不是主手段了，保留的原因只有两个：
         //   ① 1.6-1 在用户机器上跑过，没有崩宿主、没影响解锁；
         //   ② 它拦的是一个「懒启用」的判定辅助器，关掉它没有副作用。
-        //   ★ 真正解决问题的是下面第 0.7 层的 `-lockScreenCameraSupported`。
+        //   ★ 真正解决问题的是下面第 1 层的三个 bool getter（1.9-1）。
         //
         // ★ 为什么 hook 基类 UIGestureRecognizer 而不是具体类：
         //   具体类名随 iOS 版本变，且我们对「哪个类负责相机」还会有新认识；
@@ -1879,21 +1782,22 @@ __attribute__((constructor)) static void NLWInit(void)
             }
         }
 
-        // ---- 第 0.6 层：CSQuickActionsViewController -hasCamera ----
-        // ★ 1.7-1 加的这层：让「锁屏底部相机按钮」消失。
-        //   1.8-1 实测结论 —— **它管不到左滑**：只让按钮没了，左滑照进。
-        //   真正管住左滑的是下面第 0.7 层的 `-lockScreenCameraSupported`。
-        //   保留它是因为：① 让按钮一起消失，与参考插件行为一致；
-        //   ② 万一某些版本没有 0.7 层的方法，它还兜一层底；
-        //   ③ 它是无参 getter，装上零风险。
-        NLWInstallHasCameraHook();
-
-        // ---- 第 0.7 层（1.8-1 真正的主手段）：SpringBoard -lockScreenCameraSupported ----
-        // ★★★ 「禁左滑进相机」的答案在这里，不在 0.6 层。
-        //   逆向 com.yccameraflight 1.1 得到：SpringBoard 用这个方法决定
-        //   「这台设备支不支持锁屏相机」，答 NO 就不挂载相机页、左滑无从触发。
-        //   详见「七之三」章节的反汇编证据与代价说明。
-        NLWInstallLSCamHook();
+        // ---- 第 1 层（1.9-1 主手段）：三个 bool getter，一个方法一个开关 ----
+        // ★★★ 这里替代了 1.7-1 的「第 0.6 层」与 1.8-1 的「第 0.7 层」。
+        //
+        //   为什么整段换掉：1.7-1（只有 hasCamera）用户实测左滑照进；
+        //   1.8-1（+ lockScreenCameraSupported）用户实测**还是不生效**；
+        //   而同一台机器上 com.yccameraflight 1.1 **实测生效**。
+        //   两者功能等价，差别只在实现细节 —— 见「七之四」章节的分析：
+        //   极可能是「严格签名校验 B@:/c@:」把真机上的 `B16@:` 之类编码
+        //   判成"签名异常"而静默跳过，以及自实现 hook 与 MSHook 的环境差异。
+        //   本层三条装配路径全部照抄那份插件（MSHook 优先 + 不严卡签名）。
+        //
+        //   三个 hook 与三个开关的对应（用户在设置页可逐项开关）：
+        //     -hasFlashlight              ← BlockFlashlight    禁手电筒
+        //     -hasCamera                  ← BlockCameraButton  禁相机按钮
+        //     -lockScreenCameraSupported  ← BlockCameraSwipe   禁左滑
+        NLWInstallCameraTriple();
 
 
         // ---- 第 2 层：锁屏控制器 ----

@@ -130,14 +130,20 @@ for sym in UIScreenEdgePanGestureRecognizer edges Camera; do
     || { echo "✗ dylib 缺 ${sym}（禁左滑进相机会失效）"; exit 1; }
 done
 
-# ★ 1.8-1：真正管住「左滑进相机」的两个私有 getter
-#   两个都必须出现在产物里 —— 缺 hasCamera 只是按钮不消失，
-#   缺 lockScreenCameraSupported 就是**左滑照进**（1.7-1 的真实故障）。
-#   这两个名字是选择子名，编译后保留在 __objc_methname，可直接 grep。
-for sym in hasCamera lockScreenCameraSupported; do
+# ★ 1.9-1：三个 bool getter 必须都出现在产物里
+#   缺任何一个 = 对应那一项功能失效：
+#     缺 hasFlashlight              → 手电筒关不掉
+#     缺 hasCamera                  → 相机按钮关不掉
+#     缺 lockScreenCameraSupported  → **左滑照进**（1.7-1/1.8-1 的真实故障）
+for sym in hasFlashlight hasCamera lockScreenCameraSupported; do
   grep -aq "$sym" "$BUILD/NoLockWallpaper.dylib" \
-    || { echo "✗ dylib 缺 ${sym}（禁左滑进相机会失效）"; exit 1; }
+    || { echo "✗ dylib 缺 ${sym}（对应功能会失效）"; exit 1; }
 done
+
+# ★ 1.9-1：MSHookMessageEx 必须是**动态查找**（dlsym），不能是硬链接依赖。
+#   硬链接会让 dylib 在没有 Substrate 的环境里直接加载失败。
+grep -aq "MSHookMessageEx" "$BUILD/NoLockWallpaper.dylib" \
+  || { echo "✗ dylib 缺 MSHookMessageEx 字符串（装配路径会退回自实现）"; exit 1; }
 
 # 设置页开关读取指纹：配置域名与两个键名
 for sym in com.liehuu.nolockwallpaper Enabled BlockCameraSwipe \

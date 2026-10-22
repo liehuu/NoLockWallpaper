@@ -41,6 +41,36 @@
 			<key>cell</key>
 			<string>PSSwitchCell</string>
 			<key>label</key>
+			<string>禁用锁屏手电筒</string>
+			<key>defaults</key>
+			<string>com.liehuu.nolockwallpaper</string>
+			<key>key</key>
+			<string>BlockFlashlight</string>
+			<key>default</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.liehuu.nolockwallpaper/changed</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>禁用锁屏相机按钮</string>
+			<key>defaults</key>
+			<string>com.liehuu.nolockwallpaper</string>
+			<key>key</key>
+			<string>BlockCameraButton</string>
+			<key>default</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.liehuu.nolockwallpaper/changed</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
 			<string>禁用锁屏左滑进相机</string>
 			<key>defaults</key>
 			<string>com.liehuu.nolockwallpaper</string>
@@ -50,6 +80,15 @@
 			<true/>
 			<key>PostNotification</key>
 			<string>com.liehuu.nolockwallpaper/changed</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>关于上面三项</string>
+			<key>footerText</key>
+			<string>「锁屏手电筒」和「锁屏相机按钮」互不影响。&#10;「左滑进相机」这一项是系统级的开关（告诉系统本机不支持锁屏相机），打开时相机按钮一定跟着消失，无法只禁左滑而保留按钮 —— 这是同一个系统开关，不是本插件的取舍。</string>
 		</dict>
 
 		<!-- ============================================================
@@ -95,7 +134,7 @@
 			<key>label</key>
 			<string>说明</string>
 			<key>footerText</key>
-			<string>不会影响：主屏图标长按、锁屏通知长按、手电筒/相机按钮长按、上滑解锁、下拉通知中心。&#10;查看版本：设置 → 通用 → iPhone 储存空间 → NoLockWallpaper。</string>
+			<string>不会影响：主屏图标长按、锁屏通知长按与左滑删除、上滑解锁、下拉通知中心。&#10;查看版本：设置 → 通用 → iPhone 储存空间 → NoLockWallpaper。</string>
 		</dict>
 
 		<dict>
