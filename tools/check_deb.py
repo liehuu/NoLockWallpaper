@@ -14,6 +14,7 @@
 import glob
 import io
 import os
+import re
 import struct
 import sys
 import tarfile
@@ -292,10 +293,62 @@ def check_deb(path):
         chk("control.tar 含 control", any(n.endswith("control") for n in ctl_names),
             str(ctl_names))
         ctl = None
+        maint = {}      # 脚本名 -> (mode, 正文)
         tf = tarfile.open(fileobj=io.BytesIO(ctl_tar), mode="r:")
         for m in tf.getmembers():
-            if m.name.endswith("control"):
+            base = m.name.split("/")[-1]
+            if m.name.endswith("/control") or base == "control":
                 ctl = tf.extractfile(m).read().decode("utf-8", "replace")
+            elif base in ("postinst", "preinst", "postrm", "prerm"):
+                maint[base] = (m.mode,
+                               tf.extractfile(m).read().decode("utf-8", "replace"))
+
+        # ---------------- 维保脚本：绝不允许打断 dpkg 事务 ----------------
+        # ★★ 1.1-1 真实事故：postinst 里跑 sbreload 重启 SpringBoard，
+        #    Sileo 是前台 App 被一起杀掉，dpkg 事务未收尾（status 没写、
+        #    lock 没释放）→ 锁残留 + 半装 → 之后**任何** deb 都装不上。
+        #    `|| true` 只能兜「返回码非 0」，兜不住「进程被杀」。
+        #    所以这条必须在产物上验，不能只靠源码闸门（源码闸门会被绕）。
+        _MNT_BAD = (
+            (r"\bsbreload\b", "sbreload"),
+            (r"killall[^\n]*SpringBoard", "killall SpringBoard"),
+            (r"launchctl\s+(?:kickstart|restart)", "launchctl kickstart/restart"),
+            (r"\brespring\b", "respring"),
+            (r"/usr/bin/killall\b", "显式路径 killall"),
+        )
+        print("  --- 维保脚本 ---")
+        chk("control.tar 含 postinst", "postinst" in maint, str(sorted(maint)))
+        for sname in sorted(maint):
+            smode, sbody = maint[sname]
+            print("    %-10s %04o %8d B" % (sname, smode, len(sbody)))
+            chk("%s 权限 0755" % sname, (smode & 0o777) == 0o755,
+                "%04o" % (smode & 0o777))
+            chk("%s 有 shebang" % sname, sbody.startswith("#!"),
+                sbody.splitlines()[0] if sbody else "空文件")
+            # 去掉 shebang、注释行、以及 printf/echo 提示行后再判 ——
+            # ★ 提示文案里必然出现「请手动 respring」这类字样，
+            #   若把文案也纳入匹配就会 100% 误报（闸门自己写错的典型形态）。
+            #   这里只检查「真正会执行的命令」。
+            code_lines = []
+            for l in sbody.splitlines():
+                s = l.strip()
+                if not s or s.startswith("#"):
+                    continue
+                if re.match(r"^(?:printf|echo)\b", s):
+                    continue    # 纯提示输出，不动宿主进程
+                code_lines.append(l)
+            code_only = "\n".join(code_lines)
+            hits = [label for pat, label in _MNT_BAD if re.search(pat, code_only)]
+            chk("%s 不重启桌面/不杀宿主进程" % sname, not hits,
+                "命中 %s → 会打断 dpkg 事务，留下 dpkg lock 与半装状态"
+                % ", ".join(hits))
+            # postinst 结束时必须以 exit 0 / 正常结尾收场，不能半途退出
+            chk("%s 以 exit 0 结尾" % sname,
+                code_only.rstrip().splitlines()[-1].strip() == "exit 0"
+                if code_only.strip() else False,
+                code_only.rstrip().splitlines()[-1].strip()
+                if code_only.strip() else "空脚本")
+
         if ctl:
             print("  --- control 全文 ---")
             for l in ctl.splitlines():

@@ -9,7 +9,12 @@ env:
   # ★ 版本号单一来源：build.yml 的 env 与 mkdeb.sh 的入参由这里统一派生，
   #   禁止在别处硬编码（SingleVPN 踩过「包名 2.7、内容 2.8」的坑）。
   # 1.0-1 → 1.1-1：加了设置页开关 + 禁左滑进相机，同时移除日志诊断。
-  VERSION: 1.1-1
+  # ★ 1.1-1 → 1.2-1：修 postinst 里的 sbreload。
+  #   1.1-1 装包时 postinst 重启 SpringBoard，把前台的 Sileo 一起杀掉，
+  #   dpkg 事务未收尾（status 没写完、lock 没释放）→ 用户手机锁残留 + 半装，
+  #   之后任何 deb 都装不上。这是**发出去的坏版本**，必须换号重发，
+  #   否则用户会以为是同一个包、不敢再试。
+  VERSION: 1.2-1
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 

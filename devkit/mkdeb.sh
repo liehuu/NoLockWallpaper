@@ -98,21 +98,33 @@ EOF
 chmod 644 "$STAGE/DEBIAN/control"
 
 # ---- postinst ----
-# 装完提示如何生效，并说明怎么撤销。不自动 respring ——
-# 由用户自己决定时机，避免装包瞬间把桌面打断。
+# 装完只打印提示，**绝不 respring / sbreload / killall SpringBoard**。
+#
+# ★★ 这里踩过一次真实事故（1.1-1，用户 Sileo 报「dpkg 被中断，无法安装 deb」）：
+#   postinst 是 dpkg 事务的**最后一步**。在 Sileo/Zebra 里安装时，
+#   postinst 里跑 sbreload 会重启 SpringBoard，而 Sileo 是前台 App ——
+#   一起被系统终止。此时 dpkg 尚未完成收尾（写 /var/lib/dpkg/status、
+#   释放 /var/lib/dpkg/lock），事务被打断 → 锁残留 + 半装状态
+#   → 之后**任何** deb 都装不上。
+#   `|| true` 只能兜住「返回码非 0」，**兜不住「进程被杀 / 事务被切断」**。
+#   这不属于「编不过」，属于「装包时炸环境」，比功能缺失严重得多。
+#
+# 正确做法：只打印，让用户自己决定何时重启桌面。
 cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
+# 只输出提示，不做任何会影响宿主进程的动作。
 set -e
 printf '\n'
 printf 'NoLockWallpaper 已安装。\n'
-printf '生效方式：重启桌面（respring），或直接锁屏一次再解锁。\n'
+printf '生效方式：请手动重启桌面（respring）。\n'
+printf '  · Sileo/Zebra 装完后点「Restart SpringBoard」\n'
+printf '  · 或直接锁屏一次再解锁（多数情况即可生效）\n'
 printf '开关位置：设置 → NoLockWallpaper\n'
 printf '\n'
 printf '应急停用（设置打不开时）：创建空文件\n'
 printf '  /var/mobile/Library/Preferences/com.liehuu.nlw.disabled\n'
 printf '再重启桌面，插件将完全不再动手。删掉该文件即恢复。\n'
 printf '\n'
-if [ -x /usr/bin/sbreload ]; then /usr/bin/sbreload >/dev/null 2>&1 || true; fi
 exit 0
 EOF
 chmod 755 "$STAGE/DEBIAN/postinst"
