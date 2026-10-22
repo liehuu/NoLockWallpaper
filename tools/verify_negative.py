@@ -262,6 +262,16 @@ BUILD_CASES = [
         'grep -q \'__objc_exception\'',
         "build.sh 用 __gcc_except_tab 判 @try 生效",
     ),
+    (
+        # ★ 本轮 CI 真实翻车原样复现（run 39714345362）：
+        #   __objc_personality 是未定义符号，段表里根本没有 → 必然 exit 1。
+        "用 otool -l 查 __objc_personality（把符号当段查，闸门必然误报）",
+        'if xcrun nm -u "$BUILD/NoLockWallpaper.dylib" 2>/dev/null \\\n'
+        "     | grep -q '__objc_personality'; then",
+        'if xcrun otool -l "$BUILD/NoLockWallpaper.dylib" \\\n'
+        "     | grep -q '__objc_personality'; then",
+        "build.sh 不用 otool -l 查 __objc_personality",
+    ),
 ]
 
 # ★ C 组：设置页控制器源码（跑在「设置」App 进程里，崩了用户连开关都进不去）
