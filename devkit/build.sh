@@ -168,10 +168,17 @@ else
   echo "✗ 缺 __gcc_except_tab：@try/@catch 可能被优化掉，异常会漏出线程"
   exit 1
 fi
-if xcrun otool -l "$BUILD/NoLockWallpaper.dylib" | grep -q '__objc_personality'; then
-  echo "✓ 存在 __objc_personality（ObjC 异常运行时挂钩）"
+
+# ★★ __objc_personality_v0 是**未定义符号**，不是段 —— 别用 otool -l 找它。
+#   它由 libobjc 在运行期提供，本 dylib 只是引用（N_UNDF）。
+#   第一版判据写成 `otool -l | grep __objc_personality`，永远匹配不到 →
+#   闸门必然 exit 1（本轮 CI 真实翻车，run 39714345362）。
+#   正解：nm -u 看未定义符号表。
+if xcrun nm -u "$BUILD/NoLockWallpaper.dylib" 2>/dev/null \
+     | grep -q '__objc_personality'; then
+  echo "✓ 引用了 __objc_personality（ObjC 异常运行时挂钩已就位）"
 else
-  echo "✗ 缺 __objc_personality：异常可能漏出线程"
+  echo "✗ 缺 __objc_personality：@try/@catch 不会生效，异常会漏出线程"
   exit 1
 fi
 

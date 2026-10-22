@@ -1083,6 +1083,22 @@ chk("build.sh 缺 __gcc_except_tab 时是硬失败（不是提示）",
     "" if re.search(r"__gcc_except_tab.*?exit 1", _bd_code, re.S) is not None
     else "只打印提示 = 等于没拦")
 
+# ★★ __objc_personality 是**未定义符号**（由 libobjc 运行期提供），不是段。
+#   真实翻车（本轮 CI run 39714345362）：
+#     判据写成 `otool -l | grep __objc_personality` → 段表里永远没有它
+#     → 闸门必然 exit 1，编译明明成功却被判死。
+#   与「__objc_exception 段不存在」完全同源：**把符号当成段来查**。
+#   必须：查符号用 nm -u，查段用 otool -l，两者不能混。
+chk("build.sh 用 nm -u 查 __objc_personality 符号（不是 otool -l 找段）",
+    re.search(r"nm\s+-u[^\n]*\n?[^\n]*__objc_personality", _bd_code) is not None
+    or re.search(r"nm\s+-u[^|\n]*\|[^\n]*__objc_personality", _bd_code) is not None,
+    "" if re.search(r"nm\s+-u", _bd_code) is not None
+    else "用 otool -l 找未定义符号 → 永远匹配不到 → 必然 exit 1")
+chk("build.sh 不用 otool -l 查 __objc_personality（会把符号当段查）",
+    re.search(r"otool\s+-l[^\n]*__objc_personality", _bd_code) is None,
+    "" if re.search(r"otool\s+-l[^\n]*__objc_personality", _bd_code) is None
+    else "otool -l 只列段，未定义符号不在其中 → 闸门必然误报")
+
 # =====================================================================
 print("\n[A14] shell 里 $VAR 不得紧跟全角字符（bash 会算进变量名）")
 
