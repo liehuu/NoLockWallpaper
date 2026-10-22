@@ -311,6 +311,17 @@ static BOOL NLWIsCameraSwipeish(UIGestureRecognizer *g, UIView *host)
 //  四点五、临时诊断（1.3-1 专用；定位完必须整块删除）
 // ============================================================================
 //
+// ★ 前向声明（CI 真实失败过，2026-10-22）：
+//   本段插在文件靠前的位置，但它要用的是**后面才定义**的
+//   NLWIsSuppressibleLockScreenArea（在「六、压制主逻辑」里）。
+//   C 不允许隐式声明函数，漏了这两行就是：
+//     error: call to undeclared function 'NLWIsSuppressibleLockScreenArea'
+//     error: static declaration of ... follows non-static declaration
+//   ★ 通用规律：**新插入的代码块如果位置靠前，必须逐一核对它用到的
+//     每个函数是否已在前面定义或声明过**。本机无 Xcode，编译器不拦就
+//     只能等 CI —— 这类错误纯靠通读代码就能避免。
+static BOOL NLWIsSuppressibleLockScreenArea(UIView *v);
+//
 // ★ 为什么要破例在热路径写文件：
 //   实机反馈「禁长按换壁纸生效，禁左滑进相机没生效」。
 //   长按能拦 ⇒ dylib 已加载、hook 已装上，问题在**判据没命中**。

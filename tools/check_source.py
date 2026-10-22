@@ -281,6 +281,7 @@ chk("转发 viewDidAppear 前再筛一次转发桩", "NLWIsForwardingIMP(o)" in 
 # =====================================================================
 print("\n[A4d] 不得直接引用 arm64 上不存在的符号（会让 dylib 加载失败）")
 
+
 # ★★★ 本轮差点踩的坑：
 #   _objc_msgForward_stret 在 arm64 上已从 libobjc 移除。用
 #   -undefined dynamic_lookup 链接时编译期不报错，但运行期 dyld 找不到
@@ -339,6 +340,56 @@ if m:
     chk("判据在取 gestureRecognizers 之前（避免无谓数组分配）",
         i_judge != -1 and i_alloc != -1 and i_judge < i_alloc,
         "判据@%d 取数组@%d" % (i_judge, i_alloc))
+
+# =====================================================================
+print("\n[A4g] C 函数必须「先声明/定义、后使用」")
+
+# ★★ 这是 2026-10-22 CI 真实失败（run 39730344536）：
+#   为定位「禁左滑进相机不生效」，在文件靠前的位置插入了一大段诊断代码，
+#   它调用的是后面「六、压制主逻辑」里才定义的 NLWIsSuppressibleLockScreenArea。
+#   编译器报：
+#     error: call to undeclared function 'NLWIsSuppressibleLockScreenArea'
+#     error: static declaration of ... follows non-static declaration
+#   ★ 本机没有 Xcode，写代码时通读一遍就能发现，但没做 —— 白白多一轮 CI。
+#   这类错误属于「插入位置导致」的，最容易被忽略：单看新增的那段代码
+#   完全正确，错的是它跟周围代码的先后关系。
+#
+# ★ 判据做法：逐行扫描，跳过注释行，记录每个 NLW 函数**首次出现**的
+#   「static 声明或定义」行号，再找有没有更早的调用行。
+#   只看 NLW 前缀（本项目自有函数），避免把系统 API 引进来造成误报。
+
+_l = src.split("\n")
+
+
+def _is_comment_line(s):
+    s = s.strip()
+    return (not s) or s.startswith("//") or s.startswith("*") \
+        or s.startswith("/*") or s.startswith("*/")
+
+
+_first_decl = {}
+for _i, _line in enumerate(_l, 1):
+    if _is_comment_line(_line):
+        continue
+    _m = re.match(r"^static\s+[\w\s\*]*?\b(NLW\w+)\s*\(", _line.strip())
+    if _m:
+        _first_decl.setdefault(_m.group(1), _i)
+
+_bad_order = []
+for _i, _line in enumerate(_l, 1):
+    if _is_comment_line(_line):
+        continue
+    if re.match(r"^static\s+[\w\s\*]*?\bNLW\w+\s*\(", _line.strip()):
+        continue                      # 声明/定义行本身不是调用
+    for _n, _d in _first_decl.items():
+        if _i >= _d:
+            continue
+        if re.search(r"\b%s\s*\(" % _n, _line):
+            _bad_order.append("%s 在第%d行被调用，但首次声明/定义在第%d行"
+                              % (_n, _i, _d))
+chk("NLW 函数都先声明/定义后使用",
+    not _bad_order,
+    "; ".join(_bad_order[:3]) if _bad_order else "")
 
 # =====================================================================
 print("\n[A5] 绝不下钻子视图（误伤通知/手电筒 long press）")
