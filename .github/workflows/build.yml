@@ -45,7 +45,16 @@ env:
   #     系统在检测到水平滑动时才 setEnabled:YES 打开。
   #   本版改 hook -[UIGestureRecognizer setEnabled:]，直接拦「启用」这个动作，
   #   并保留压制循环里的即时压制作为双保险（hook 管将来，这里管现在）。
-  VERSION: 1.6-1
+  # ★ 1.7-1：**第四次修复，换掉了整条思路**。1.6-1 日志（8 次 blocked=1，
+  #   而相机照样打开）证明「相机入口是某个我能拦住的手势」这个假设本身不成立。
+  #   答案来自逆向一份现成插件（com.cydia.love.xtyh 1.7）：
+  #   它不 hook 任何手势，只让 CSQuickActionsViewController 的 -hasCamera
+  #   返回 NO —— 系统认为设备没有相机，相机页不加载，左滑无从触发。
+  #   反汇编证据：0x6fd4 取类名、0x6fe8/0x700c 加载 hasFlashlight/hasCamera
+  #   两个 selref，对应 hook 函数 0x736c/0x7374 均为 `mov w0,#0; ret`。
+  #   本版只跟 hasCamera（不动手电筒），开关关闭时转发原实现（实时生效，
+  #   不留恢复负担）。代价：锁屏相机按钮也会一起消失，交付说明里写明。
+  VERSION: 1.7-1
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 

@@ -18,7 +18,7 @@ import sys
 import urllib.request
 
 REPO = "liehuu/NoLockWallpaper"
-BRANCH = "main"
+BRANCH = "master"
 REPO_DIR = r"C:/Users/fengb/WorkBuddy/2026-10-17-20-12-03/NoLockWallpaper-build"
 GCM = r"C:/Users/fengb/AppData/Local/Programs/WorkBuddy/resources/vendor/PortableGit/mingw64/bin/git-credential-manager.exe"
 API = "https://api.github.com"

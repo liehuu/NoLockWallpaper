@@ -981,6 +981,7 @@ static BOOL NLWIsSuppressibleLockScreenArea(UIView *v)
     return selfIsLS;
 }
 
+
 /// 处理一个视图**自身挂载**的手势。
 /// ★ 绝不下钻 subviews —— 见文件头「最重要的安全边界」。
 static NSUInteger NLWProcessView(UIView *v)
@@ -1169,6 +1170,145 @@ static BOOL NLWInstallHook(Class cls, SEL sel, IMP newImp, IMP *origOut,
     } @catch (NSException *e) {
         return NO;
     }
+}
+
+// ============================================================================
+//  七之二、1.7-1：真正的解法 —— hook `-hasCamera`，让系统认为没有相机
+// ============================================================================
+//
+// ★★★ 这一版换了思路：不再跟手势较劲，而是直接告诉系统「这台设备没有相机」。
+//
+//   前四轮全在找「哪个手势触发相机」：
+//     1.3-1  判 edge pan        → 日志里 edges 无 8，判据落空
+//     1.4-1  判手势自述        → 108 条里 camera 出现 0 次
+//     1.5-1  判 swipe 方向      → dir 全是 -，仍然 0 次
+//     1.6-1  拦 setEnabled:     → **8 次 blocked=1，相机照进**
+//   1.6-1 的日志是最有价值的一份：它证明拦截**确实生效了**，
+//   而相机照样打开 —— 所以「相机入口是某个我能拦住的手势」这个假设
+//   本身就不成立，再往下微调判据也只是换个地方落空。
+//
+// ★ 答案来自一份现成插件（com.cydia.love.xtyh 1.7，2026-10-22 逆向分析）：
+//   它的「禁用锁屏左滑相机」只做了一件事 ——
+//
+//       Class c = objc_getClass("CSQuickActionsViewController");
+//       MSHookMessageEx(c, @selector(hasFlashlight), ret_NO, &orig);
+//       MSHookMessageEx(c, @selector(hasCamera),     ret_NO, &orig);
+//
+//   反汇编证据（systemyh.dylib，arm64 切片）：
+//     0x6fd4  adr x0, #0x7a54      → 字符串 "CSQuickActionsViewController"
+//     0x6fdc  bl  objc_getClass
+//     0x6fe0  mov x19, x0          → 类存起来，后面两次 hook 共用
+//     0x6fe8  ldr x1, #0xc070      → selref "hasFlashlight"
+//     0x6ff4  adr x16, #0x736c     → hook 函数
+//     0x700c  ldr x1, #0xc068      → selref "hasCamera"
+//     0x7018  adr x16, #0x7374     → hook 函数
+//     0x736c  mov w0, #0 ; ret     ← hasFlashlight 的 hook：直接返回 NO
+//     0x7374  mov w0, #0 ; ret     ← hasCamera     的 hook：直接返回 NO
+//
+//   —— 没有 hook 任何手势，就一句「返回 NO」。
+//
+// ★ 为什么返回 NO 能连「左滑」一起禁掉：
+//   `CSQuickActionsViewController` 是锁屏底部快捷操作（手电筒/相机）的控制器，
+//   而 CoverSheet 在决定「给这台设备启用哪些相机入口」时查的就是 `-hasCamera`。
+//   返回 NO ⇒ 系统认为设备没有相机 ⇒ **相机页不加载，左滑自然无从触发**。
+//   一个开关管住整条链路，比逐个拦手势彻底得多。
+//
+// ★ 代价（必须在交付说明里写清楚）：
+//   锁屏右下角的**相机按钮也会一起消失**。按钮和手势共用这个开关，
+//   没有「只禁手势、保留按钮」的子选项 —— 去 hook 手势本身做不到，
+//   前四轮已经用实机日志证明过了。
+//
+// ★ 为什么这个 hook 是四版里最安全的：
+//   ① `-hasCamera` 是**无参 getter**，返回 BOOL，签名 `B@:` 无歧义
+//      （对比 hook 私有手势：类名、是否存在、参数个数全靠猜）；
+//   ② 类不存在 → 干净跳过（iOS 版本差异）；
+//   ③ 方法签名不符 → 干净跳过；
+//   ④ 开关关闭时**转发原实现**，不改状态、不留恢复负担；
+//   ⑤ 全程 @try，异常绝不出线程。
+
+static IMP gOrigHasCamera = NULL;
+static NSUInteger gHasCameraCalls = 0;
+
+/// hook 体：开关关着一律转发原实现；只在该禁的时候返回 NO。
+///
+/// ★ 为什么不用「关开关时把 IMP 改回去」：
+///   改 IMP 有时序问题（谁来改、何时改），一旦漏恢复，用户关掉开关后
+///   相机仍然消失 —— 属于「开关是假的」那类缺陷，而且极难排查。
+///   这里每次调用都看一遍开关，代价是两次 BOOL 比较，但绝不留残留状态。
+static BOOL NLWHasCamera(id self, SEL _cmd)
+{
+    BOOL blocked = NO;
+    @try {
+        blocked = (gEnabled && gBlockCameraSwipe);
+    } @catch (NSException *e) { }
+
+    if (!blocked) {
+        if (gOrigHasCamera) {
+            return ((BOOL (*)(id, SEL))gOrigHasCamera)(self, _cmd);
+        }
+        return YES;      // 没拿到 orig（理论上不会走到）→ 保守放行
+    }
+
+    // 诊断：前 8 次调用留痕。用来看「系统到底在什么时机查这个属性」——
+    // 如果屏幕上相机确实没了，这 8 条就是成功证据；
+    // 如果相机还在，说明这个属性管不到手势，日志会显示它被查了但没起作用。
+    @try {
+        if (gHasCameraCalls < 8) {
+            gHasCameraCalls++;
+            NLWDiagAdd([NSString stringWithFormat:
+                @"[hasCamera#%lu] -> NO  cls=%s",
+                (unsigned long)gHasCameraCalls,
+                class_getName(object_getClass(self))]);
+        }
+    } @catch (NSException *e) { }
+
+    return NO;
+}
+
+/// 安装 `-hasCamera` 的 hook。返回是否装上。
+static BOOL NLWInstallHasCameraHook(void)
+{
+    @try {
+        Class c = NSClassFromString(@"CSQuickActionsViewController");
+        if (!c) {
+            NLWDiagAdd(@"[hook] CSQuickActionsViewController 不存在 → 跳过");
+            return NO;
+        }
+
+        Method m = class_getInstanceMethod(c, @selector(hasCamera));
+        if (!m) {
+            NLWDiagAdd(@"[hook] -hasCamera 不存在 → 跳过");
+            return NO;
+        }
+
+        // ★ 签名校验：必须是无参实例方法（`B@:` 或 `c@:`）。
+        //   真出现带参数的版本就跳过 —— 「签名不符干净跳过」是项目铁律：
+        //   硬上等于用错的参数个数去调原实现，那是必崩。
+        const char *enc = method_getTypeEncoding(m);
+        BOOL encOK = (enc && (strncmp(enc, "B@:", 3) == 0 ||
+                              strncmp(enc, "c@:", 3) == 0));
+        if (!encOK) {
+            NLWDiagAdd([NSString stringWithFormat:
+                @"[hook] -hasCamera 签名异常 enc=%s → 跳过",
+                enc ? enc : "(null)"]);
+            return NO;
+        }
+
+        IMP o = NULL;
+        // ★ 传真实 enc 而不是写死 "B@:"：万一哪天变成 c@:，
+        //   class_addMethod 用错编码会造出一个签名不符的方法。
+        if (!NLWInstallHook(c, @selector(hasCamera), (IMP)NLWHasCamera,
+                            &o, enc)) {
+            NLWDiagAdd(@"[hook] -hasCamera 安装失败 → 跳过");
+            return NO;
+        }
+        gOrigHasCamera = o;
+        NLWDiagAdd([NSString stringWithFormat:
+            @"[hook] -hasCamera 已装上 enc=%s orig=%p",
+            enc, (void *)o]);
+        return YES;
+    } @catch (NSException *e) { }
+    return NO;
 }
 
 // ============================================================================
@@ -1406,6 +1546,9 @@ static void NLWOnPrefsChanged(CFNotificationCenterRef center, void *observer,
                 // 开 → 关：把已经改掉的手势恢复原样，立刻生效
                 NLWRestoreAllSuppressed();
             }
+            // ★ 1.7-1：`-hasCamera` 的 hook **不需要**在这里恢复 ——
+            //   它每次被调用时会先看开关，关了就直接转发原实现。
+            //   这比「改回原 IMP」安全：不漏恢复、不怕时序、无状态。
             // 关 → 开：什么也不用做。后续视图上屏 / 锁屏出现时，
             //          hook 会因为 gEnabled 变回 YES 而重新压制。
         } @catch (NSException *e) { }
@@ -1463,12 +1606,12 @@ __attribute__((constructor)) static void NLWInit(void)
         }
 
         // ---- 第 0.5 层：UIGestureRecognizer -setEnabled: ----
-        // ★★ 为什么必须有这一层（1.6-1）：
-        //   相机入口 `CSHorizontalScrollFailureRecognizer` 是**懒启用**的：
-        //   抓到它时 enabled 就是 NO，系统在检测到水平滑动时才临时打开。
-        //   前三版的压制手段只有 enabled=NO → 对它**完全没有作用**，
-        //   等于一直在压制一个本来就是 NO 的东西。
-        //   必须拦「启用」这个动作本身。
+        // ★ 1.6-1 加的这层，1.7-1 实测证明它**拦住了但没用**：
+        //   日志里 8 次 `blocked=1`，相机照样打开。
+        //   所以它已经不是主手段了，保留的原因只有两个：
+        //   ① 1.6-1 在用户机器上跑过，没有崩宿主、没影响解锁；
+        //   ② 它拦的是一个「懒启用」的判定辅助器，关掉它没有副作用。
+        //   ★ 真正解决问题的是下面第 0.6 层的 `-hasCamera`。
         //
         // ★ 为什么 hook 基类 UIGestureRecognizer 而不是具体类：
         //   具体类名随 iOS 版本变，且我们对「哪个类负责相机」还会有新认识；
@@ -1483,6 +1626,15 @@ __attribute__((constructor)) static void NLWInit(void)
                 gOrigSetEnabled = o;
             }
         }
+
+        // ---- 第 0.6 层（主）：CSQuickActionsViewController -hasCamera ----
+        // ★★★ 这一层才是「禁锁屏左滑进相机」的答案（1.7-1）。
+        //   思路来自逆向一份现成插件：它没有 hook 任何手势，
+        //   只让 `-hasCamera` 返回 NO，系统就认为设备没有相机，
+        //   于是相机页不加载、左滑无从触发。
+        //   详见「七之二」章节里的反汇编证据与代价说明。
+        NLWInstallHasCameraHook();
+
 
         // ---- 第 2 层：锁屏控制器 ----
         // ★ 这三个类名是「都可能存在但不一定都存在」的关系：

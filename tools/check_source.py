@@ -478,7 +478,11 @@ for f in forbidden:
 #   相机入口是懒启用的，压制它的唯一办法就是拦这个 setter。
 hooked_sel = re.findall(r"@selector\(([^)]+)\)", code)
 allowed = {"addGestureRecognizer:", "didMoveToWindow", "viewDidAppear:",
-           "setEnabled:"}
+           "setEnabled:", "hasCamera"}
+# ★ 1.7-1 加 `hasCamera`：它不是「放宽纪律」，而是本项目 hook 面唯一一个
+#   私有 API，且是**无参 getter**（返回值 BOOL，签名无歧义）——
+#   与「hook 私有方法要猜参数个数」的风险完全不是一个量级。
+#   它替换掉的是前四版全部失败的手势判据（见 [A4j]）。
 extra = [s.strip() for s in hooked_sel if s.strip() not in allowed]
 chk("只 hook 了公开 API", not extra, "多出的：%s" % extra if extra else
     "addGestureRecognizer: / didMoveToWindow / viewDidAppear: / setEnabled:")
@@ -543,6 +547,101 @@ chk("压制循环里对相机入口类做了即时压制（hook 管将来，这�
     is not None,
     "" if "NLWIsCameraEntryGestureClass(\n" in code else
     "只有 setEnabled hook，抓到时已启用的那次压不到")
+
+# =====================================================================
+print("\n[A4j] 1.7-1：让系统认为「这台设备没有相机」")
+# ★★★ 为什么这一组必须存在 —— 前四版全部失败，第五版才走对路：
+#   1.3-1 判 edge pan、1.4-1 判自述、1.5-1 判 swipe、1.6-1 拦 setEnabled，
+#   四轮全部由实机日志推翻。1.6-1 的日志尤其决定性：
+#   **8 次 blocked=1，相机照样打开** —— 证明「相机入口是某个可拦手势」
+#   这个假设本身不成立。
+#
+#   答案来自逆向一份现成插件（com.cydia.love.xtyh 1.7）：
+#   它只 hook `CSQuickActionsViewController -hasCamera` 返回 NO，
+#   不碰任何手势。系统认为没相机 ⇒ 相机页不加载 ⇒ 左滑无从触发。
+#
+# ★ 这一组锁三件事：
+#   ① hook 面必须极小（一个类、一个无参 getter）；
+#   ② 开关必须实时生效（关掉后转发原实现，而不是改 IMP）；
+#   ③ 不许顺手把 hasFlashlight 也禁掉（用户没要求，多改一处就多一份误伤）。
+
+chk("有 hasCamera hook 安装函数",
+    # ★ 必须匹配「函数签名 + 参数表」，不能用子串 `in` ——
+    #   把函数改名成 NLWInstallHasCameraHookRemoved 时前缀仍在，
+    #   子串判据照样报绿（本项目踩过：_MNT_BAD → _MNT_BAD_UNUSED）。
+    re.search(r"static BOOL NLWInstallHasCameraHook\(void\)", code) is not None,
+    "" if re.search(r"static BOOL NLWInstallHasCameraHook\(void\)", code) else
+    "没有这个函数，相机入口根本没被动过")
+
+chk("hook 目标类精确为 CSQuickActionsViewController",
+    # ★ 必须查 src：类名字符串被 strip_code 换成空格，查 code 必然假红。
+    re.search(r'NSClassFromString\(@"CSQuickActionsViewController"\)', src)
+    is not None,
+    "" if re.search(r'@"CSQuickActionsViewController"', src) else
+    "类名不是 CSQuickActionsViewController → 返回 NO 也管不到相机")
+
+chk("hook 选择子为 hasCamera（取方法 + 安装两处都要对）",
+    # ★ 两处必须一致：一处取 Method 校验签名、一处真的装 hook。
+    #   只改一处是最隐蔽的错法 —— 编译照过、装上去 hook 的是别的方法，
+    #   日志还会显示"已装上"。所以按次数卡。
+    code.count("@selector(hasCamera)") >= 2,
+    "实际 %d 处" % code.count("@selector(hasCamera)") if
+    code.count("@selector(hasCamera)") < 2 else "")
+
+chk("类/方法不存在时干净跳过（版本差异不硬上）",
+    re.search(r"if\s*\(!c\)\s*\{", code) is not None
+    and re.search(r"if\s*\(!m\)\s*\{", code) is not None,
+    "" if re.search(r"if\s*\(!m\)\s*\{", code) else
+    "缺 if (!m) → 类在但方法不在时会拿 NULL Method 继续走")
+
+chk("★ 没有顺手禁掉手电筒（hasFlashlight 不得出现）",
+    # ★ 现成插件把 hasCamera 和 hasFlashlight 一起禁了。
+    #   本项目的需求只有「禁左滑进相机」，手电筒属于无关功能 ——
+    #   多禁一个就是多一处用户没同意的行为改变。
+    "hasFlashlight" not in code,
+    "" if "hasFlashlight" not in code else
+    "出现 hasFlashlight → 手电筒被一起禁掉了，超出需求")
+
+chk("★ 签名不符时干净跳过（enc 必须校验 B@: / c@:）",
+    # ★ 这是崩宿主防线：签名不对还硬上，等于用错参数个数调原实现。
+    re.search(r'strncmp\(enc,\s*"B@:",\s*3\)', src) is not None
+    and re.search(r'strncmp\(enc,\s*"c@:",\s*3\)', src) is not None,
+    "" if re.search(r'strncmp\(enc,\s*"B@:",\s*3\)', src) else
+    "没校验签名 → 万一 Apple 改签名就是必崩")
+
+chk("安装时用真实 enc 而非写死字面量",
+    # ★ class_addMethod 用错编码会造出一个签名不符的方法，
+    #   之后系统按错误签名调用 = 参数错位。必须传 method_getTypeEncoding 的结果。
+    re.search(r"&o,\s*enc\)", code) is not None,
+    "" if "&o, enc)" in code else "写死了编码 → addMethod 可能造出错误签名")
+
+chk("hasCamera hook 体：开关关着就转发原实现",
+    # ★ 实时生效的实现方式：不是「改回 IMP」，而是每次调用看开关。
+    #   这样不存在「漏恢复 → 开关是假的」这类缺陷。
+    re.search(r"\(\(BOOL \(\*\)\(id, SEL\)\)gOrigHasCamera\)\(self, _cmd\)", code)
+    is not None,
+    "" if "((BOOL (*)(id, SEL))gOrigHasCamera)(self, _cmd)" in code else
+    "开关关掉后不转发原实现 → 相机永久消失，开关变假")
+
+chk("开关判断用 gEnabled && gBlockCameraSwipe",
+    # ★ 两个开关都要尊重：总开关关了要放行，子开关关了也要放行。
+    # ★ 判据必须锚到 `blocked = (...)` 这个赋值 —— 源码里
+    #   NLWSetEnabled 也有 `if (gEnabled && gBlockCameraSwipe)`，
+    #   只查到那一处就会漏放「hasCamera 只看总开关」这种错。
+    re.search(r"blocked\s*=\s*\(gEnabled\s*&&\s*gBlockCameraSwipe\)", code)
+    is not None,
+    "" if re.search(r"blocked\s*=\s*\(gEnabled\s*&&\s*gBlockCameraSwipe\)", code)
+    else "只看一个开关 → 另一个开关拨了没反应")
+
+chk("orig 指针存在且有判空",
+    "static IMP gOrigHasCamera" in code and
+    re.search(r"if\s*\(gOrigHasCamera\)", code) is not None,
+    "" if "static IMP gOrigHasCamera" in code else "没保存 orig → 无法转发")
+
+chk("在 NLWInit 里真正调用了安装函数",
+    re.search(r"^\s*NLWInstallHasCameraHook\(\s*\);", code, re.M) is not None,
+    "" if re.search(r"^\s*NLWInstallHasCameraHook\(\s*\);", code, re.M) else
+    "函数写了但没调用 → 永远不生效")
 
 # =====================================================================
 print("\n[A7] 热路径零 IO（watchdog 会杀进程）")

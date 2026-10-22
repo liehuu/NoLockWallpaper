@@ -354,6 +354,82 @@ CASES = [
         "                        NLWIsCameraEntryGestureClass(",
         "压制循环里对相机入口类做了即时压制",
     ),
+    # ------------------------------------------------------------------
+    # 1.7-1：hasCamera 方案（10 条）
+    # ★ 这一组守的是「四轮失败后终于走对的那条路」，每条都对应一个
+    #   真实可能犯的错，而不是凑数。
+    # ------------------------------------------------------------------
+    (
+        "去掉 -hasCamera 签名校验（Apple 改签名后必崩）",
+        '        BOOL encOK = (enc && (strncmp(enc, "B@:", 3) == 0 ||\n'
+        '                              strncmp(enc, "c@:", 3) == 0));',
+        "        BOOL encOK = YES;",
+        "签名不符时干净跳过",
+    ),
+    (
+        "安装时写死签名编码（addMethod 可能造出错误签名）",
+        "                            &o, enc)) {",
+        '                            &o, "B@:")) {',
+        "安装时用真实 enc 而非写死字面量",
+    ),
+    (
+        "开关关闭时不转发原实现（相机永久消失，开关变假）",
+        "            return ((BOOL (*)(id, SEL))gOrigHasCamera)(self, _cmd);",
+        "            return NO;",
+        "开关关着就转发原实现",
+    ),
+    (
+        "只看总开关、忽略相机子开关（子开关拨了没反应）",
+        "        blocked = (gEnabled && gBlockCameraSwipe);",
+        "        blocked = gEnabled;",
+        "开关判断用 gEnabled && gBlockCameraSwipe",
+    ),
+    (
+        "★ 顺手把手电筒也禁了（超出需求，多一份误伤）",
+        "        Method m = class_getInstanceMethod(c, @selector(hasCamera));",
+        '        NLWInstallHook(c, @selector(hasFlashlight), (IMP)NLWHasCamera, NULL, "B@:");\n'
+        "        Method m = class_getInstanceMethod(c, @selector(hasCamera));",
+        "没有顺手禁掉手电筒",
+    ),
+    (
+        "hook 目标类写错（返回 NO 也管不到相机）",
+        'NSClassFromString(@"CSQuickActionsViewController")',
+        'NSClassFromString(@"CSLockScreenSettings")',
+        "hook 目标类精确为 CSQuickActionsViewController",
+    ),
+    (
+        "安装函数写了但 NLWInit 里没调用（永远不生效）",
+        "        NLWInstallHasCameraHook();\n",
+        "",
+        "在 NLWInit 里真正调用了安装函数",
+    ),
+    (
+        "orig 判空被删（orig 为 NULL 时调空指针 = 必崩）",
+        "        if (gOrigHasCamera) {\n"
+        "            return ((BOOL (*)(id, SEL))gOrigHasCamera)(self, _cmd);\n"
+        "        }\n"
+        "        return YES;",
+        "        return ((BOOL (*)(id, SEL))gOrigHasCamera)(self, _cmd);",
+        "orig 指针存在且有判空",
+    ),
+    (
+        "★ 只改一处选择子（另一处仍 hook 别的方法，日志还会显示已装上）",
+        "@selector(hasCamera), (IMP)NLWHasCamera,",
+        "@selector(hasFlashlight), (IMP)NLWHasCamera,",
+        "hook 选择子为 hasCamera",
+    ),
+    (
+        "去掉 if (!m) 判空（类在但方法不在时拿 NULL Method 继续走）",
+        "        if (!m) {\n            NLWDiagAdd(@\"[hook] -hasCamera 不存在 → 跳过\");\n            return NO;\n        }",
+        "        if (NO) {\n            NLWDiagAdd(@\"[hook] -hasCamera 不存在 → 跳过\");\n            return NO;\n        }",
+        "类/方法不存在时干净跳过",
+    ),
+    (
+        "整个安装函数被删（相机入口完全没被动过）",
+        "static BOOL NLWInstallHasCameraHook(void)",
+        "static BOOL NLWInstallHasCameraHookRemoved(void)",
+        "有 hasCamera hook 安装函数",
+    ),
 ]
 
 # ★ B 组：构建闸门本身的判据写错（真实误报过一次，潜伏三个 run 才暴露）
