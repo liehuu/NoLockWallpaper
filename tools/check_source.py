@@ -22,7 +22,8 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #   的 Tweak.m 副本，通过这个环境变量指过来，避免污染工作区真实文件。
 #   不设该变量时行为与以前完全一致。
 SRC = os.environ.get("NLW_SRC_OVERRIDE") or os.path.join(_REPO, "Tweak.m")
-BUILD = os.path.join(_REPO, "devkit", "build.sh")
+# ★ 同理支持替换 build.sh：反向验证要证明「构建闸门判据写错会 FAIL」。
+BUILD = os.environ.get("NLW_BUILD_OVERRIDE") or os.path.join(_REPO, "devkit", "build.sh")
 MKDEB = os.path.join(_REPO, "devkit", "mkdeb.sh")
 PLIST = os.path.join(_REPO, "NoLockWallpaper.plist")
 
@@ -577,6 +578,46 @@ chk("build.sh 走 mkdeb.sh 打包", "mkdeb.sh" in bd)
 chk("build.sh 覆盖 arm64e 与 arm64",
     "arm64e" in bd and "arm64)" in bd)
 chk("build.sh 校验架构切片", "lipo -info" in bd)
+
+# =====================================================================
+print("\n[A13b] 功能指纹闸门：属性名 vs 选择子名（真实误报过一次）")
+
+# ★★ 这是一个「闸门自己写错」的真实案例，必须长期防住：
+#   代码里用点语法赋值 `g.minimumPressDuration = 90.0;`，
+#   编译器翻成 objc_msgSend(g, @selector(setMinimumPressDuration:), 90.0)，
+#   落到 __objc_methname 的字符串是 setMinimumPressDuration（带 set、大写 M）。
+#   而闸门最初写的是 getter 名 minimumPressDuration，大小写敏感 → 永远匹配
+#   不到 → 每次构建都误报「缺符号」。这个缺陷在编译错误的掩盖下潜伏了
+#   整整三个 run（前几次都先崩在编译阶段，根本没跑到这一步）。
+chk("代码确实在赋 minimumPressDuration（闸门的前提成立）",
+    ".minimumPressDuration = 90.0" in code,
+    "" if ".minimumPressDuration = 90.0" in code else "改写法后闸门前提要重新确认")
+
+# ★ 判据必须只扫「for sym 列表本身」，不能全文搜 bd。
+#   为什么：注释里也会提到 setMinimumPressDuration（就是上面那段说明），
+#   全文搜会被自己的注释蒙过去 —— 反向验证 B1 实测漏放，正是这个原因。
+#   「把说明文字当成代码」这个坑本项目已经犯过四次，这里必须精确到结构。
+_fp_block = []
+_m = re.search(r"for sym in (.*?);\s*do", bd, re.S)
+if _m:
+    _fp_block = _m.group(1).split()
+chk("能解析出指纹列表 for sym", bool(_fp_block),
+    "解析到 %d 项" % len(_fp_block) if _fp_block else "解析失败，判据无效")
+
+chk("指纹列表含 setMinimumPressDuration（setter 名）",
+    "setMinimumPressDuration" in _fp_block,
+    "" if "setMinimumPressDuration" in _fp_block else "缺 setter 名，闸门永远匹配不到")
+chk("指纹列表不含裸 getter 名 minimumPressDuration",
+    "minimumPressDuration" not in _fp_block,
+    "" if "minimumPressDuration" not in _fp_block else "属性名 ≠ 选择子名")
+
+chk("指纹列表覆盖三个 hook 选择子",
+    all(x in _fp_block for x in
+        ["addGestureRecognizer:", "didMoveToWindow", "viewDidAppear:"]),
+    "实际：%s" % _fp_block)
+chk("指纹列表覆盖锁屏类名判据关键串",
+    "LockScreen" in _fp_block and "CoverSheet" in _fp_block,
+    "实际：%s" % _fp_block)
 
 # =====================================================================
 print("\n[A14] shell 里 $VAR 不得紧跟全角字符（bash 会算进变量名）")

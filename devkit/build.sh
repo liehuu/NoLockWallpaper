@@ -68,8 +68,17 @@ echo "✓ 架构校验通过（${CPU}）"
 # ---------- 4) 功能指纹闸门 ----------
 # 这些符号/字符串任何一条丢了，产物表面看不出来，装到机器上就是功能缺失。
 # ★ ObjC 选择子不进 nm -u（走 _objc_msgSend + __objc_methname），只能 grep -a。
+#
+# ★★ 这里踩过一个「闸门自己写错」的坑，记录清楚免得再犯：
+#   代码里写的是点语法赋值 `g.minimumPressDuration = 90.0;`，
+#   编译器把它翻成 objc_msgSend(g, @selector(setMinimumPressDuration:), 90.0)
+#   —— 落在 __objc_methname 里的字符串是 **setMinimumPressDuration:**
+#   （带 set 前缀、大写 M）。
+#   最初的判据写的是 `minimumPressDuration`（getter 名），
+#   大小写敏感 → 永远匹配不到 → 每次构建都在这里误报「缺符号」。
+#   注意：属性名 ≠ 选择子名。凡是通过「赋值」使用的属性，指纹必须写 setter 名。
 for sym in addGestureRecognizer: didMoveToWindow viewDidAppear: \
-           UILongPressGestureRecognizer minimumPressDuration \
+           UILongPressGestureRecognizer setMinimumPressDuration \
            LockScreen CoverSheet; do
   grep -aq "$sym" "$BUILD/NoLockWallpaper.dylib" \
     || { echo "✗ dylib 缺 ${sym}（功能会缺失）"; exit 1; }
