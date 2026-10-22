@@ -36,7 +36,15 @@
 //      自己声明只能骗过编译器，骗不过运行时：ivar 的访问偏移是编译期
 //      按声明布局算的，与真实 PSListController 差一个字段，就会读到错误的
 //      内存位置 —— 那不是「编译不过」，是**运行期崩设置 App**。
-//      正解：用 objc runtime 按名字取偏移（见下面的 NLWSpecifiersOffset）。
+//
+//   8. ★★★ 取到 ivar 之后，**不要用指针算术去读写它**
+//      ARC 禁止把 `char *` 强转成 `NSArray *__strong *`：
+//        `*(NSArray **)((char *)self + off)`
+//        → error: cast of a non-Objective-C pointer type 'char *' to
+//          'NSArray *__strong *' is disallowed with ARC
+//      这种写法在非 ARC 代码里到处都是，所以"凭经验就会这么写"，
+//      而且**本机没 Xcode 时只能等 CI 报错**（本轮真实踩到，4 个 error）。
+//      正解：拿 Ivar 句柄，用 object_getIvar / object_setIvar 存取。
 //
 
 #import "NoLockWallpaperRootListController.h"
@@ -54,51 +62,59 @@
 
 @implementation NoLockWallpaperRootListController
 
-#pragma mark - _specifiers ivar（按名字取偏移，绝不自己声明）
+#pragma mark - _specifiers ivar（按名字取 Ivar，绝不自己声明）
 
-/// 取父类 PSListController 的 `_specifiers` ivar 偏移（字节）。
+/// 取父类 PSListController 的 `_specifiers` ivar 句柄。
 ///
-/// ★ 返回 0 表示「取不到」，调用方必须退化成「不缓存、每次重新载入」——
-///   慢一点但绝不崩。**不能把 0 当成合法偏移去读写**（那就是读 self->isa）。
-static ptrdiff_t NLWSpecifiersOffset(BOOL *found)
+/// ★ 为什么返回 Ivar 而不是偏移量：
+///   ARC 下**禁止**把裸指针强转成带所有权的对象指针 ——
+///     `*(NSArray **)((char *)self + off)`            ← error: cast of a
+///     non-Objective-C pointer type 'char *' to 'NSArray *__strong *'
+///     is disallowed with ARC
+///   这类写法在非 ARC 下合法，所以**很容易凭经验写出来**，本机又没 Xcode，
+///   只能等 CI 报错才发现。判据见 tools/check_source.py 的 A7c「ARC 非法强转」。
+///   正解：拿 Ivar 句柄，用 runtime 的 object_getIvar / object_setIvar 存取，
+///   全程不做指针算术、不做跨所有权转换。
+///
+/// ★ 返回 NULL 表示「取不到」，调用方必须退化成「不缓存、每次重新载入」——
+///   慢一点但绝不崩。
+static Ivar NLWSpecifiersIvar(void)
 {
-    static ptrdiff_t off = 0;
+    static Ivar iv = NULL;
     static BOOL resolved = NO;
-    static BOOL ok = NO;
     if (!resolved) {
         resolved = YES;
         @try {
-            Ivar iv = class_getInstanceVariable([PSListController class],
-                                                "_specifiers");
-            if (iv) {
-                off = ivar_getOffset(iv);
-                ok  = (off > 0);        // 偏移 0 不可能（那是 isa）
-            }
-        } @catch (NSException *e) { ok = NO; }
+            iv = class_getInstanceVariable([PSListController class],
+                                           "_specifiers");
+        } @catch (NSException *e) { iv = NULL; }
     }
-    if (found) *found = ok;
-    return ok ? off : 0;
+    return iv;
 }
 
 static NSArray *NLWGetSpecifiers(id self)
 {
-    BOOL ok = NO;
-    ptrdiff_t off = NLWSpecifiersOffset(&ok);
-    if (!ok) return nil;
+    Ivar iv = NLWSpecifiersIvar();
+    if (!iv) return nil;
+    id v = nil;
     @try {
-        return *(NSArray **)((char *)(__bridge void *)self + off);
+        v = object_getIvar(self, iv);
     } @catch (NSException *e) {
         return nil;
     }
+    // 防御：父类该 ivar 也可能存了非数组（版本差异），类型不符就当没有
+    if (v && [v isKindOfClass:[NSArray class]]) return (NSArray *)v;
+    return nil;
 }
 
 static void NLWSetSpecifiers(id self, NSArray *v)
 {
-    BOOL ok = NO;
-    ptrdiff_t off = NLWSpecifiersOffset(&ok);
-    if (!ok) return;
+    Ivar iv = NLWSpecifiersIvar();
+    if (!iv) return;
     @try {
-        *(NSArray **)((char *)(__bridge void *)self + off) = v;
+        // object_setIvar 对 strong ivar 会自动走 store-strong 语义
+        // （release 旧值 + retain 新值），不需要我们手工管理。
+        object_setIvar(self, iv, v);
     } @catch (NSException *e) { }
 }
 

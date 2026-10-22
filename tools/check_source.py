@@ -627,11 +627,35 @@ if os.path.isfile(PREFM):
         re.search(r"NSArray\s*\*\s*_specifiers\s*;", pm_code) is None,
         "" if re.search(r"NSArray\s*\*\s*_specifiers\s*;", pm_code) is None
         else "自己声明的 ivar 偏移与真实类不一致，运行期读错内存")
-    chk("设置页用 runtime 按名字取 _specifiers 偏移",
-        "class_getInstanceVariable" in pm_code and "ivar_getOffset" in pm_code)
-    chk("设置页对「取不到偏移」有退化处理（不缓存、不崩）",
-        re.search(r"if\s*\(!ok\)\s*return\s+nil;", pm_code) is not None,
-        "" if re.search(r"if\s*\(!ok\)\s*return\s+nil;", pm_code) else "缺退化处理")
+    chk("设置页用 runtime 按名字取 _specifiers（不自己声明 ivar）",
+        "class_getInstanceVariable" in pm_code,
+        "" if "class_getInstanceVariable" in pm_code else "缺按名字取 ivar 的路径")
+    chk("设置页对「取不到 ivar」有退化处理（不缓存、不崩）",
+        re.search(r"if\s*\(!\s*iv\s*\)\s*return", pm_code) is not None
+        or re.search(r"if\s*\(!iv\)\s*return", pm_code) is not None,
+        "" if re.search(r"if\s*\(!\s*iv\s*\)\s*return", pm_code) is not None
+        or re.search(r"if\s*\(!iv\)\s*return", pm_code) is not None
+        else "缺退化处理")
+
+    # ★★★ [本轮 CI 真实失败] ARC 禁止把裸指针强转成带所有权的对象指针。
+    #   写出来的基本都是这一句（非 ARC 里到处都有，所以"凭经验就会这么写"）：
+    #     *(NSArray **)((char *)self + off) = v;
+    #     return *(NSArray **)((char *)(__bridge void *)self + off);
+    #   → error: cast of a non-Objective-C pointer type 'char *' to
+    #     'NSArray *__strong *' is disallowed with ARC
+    #   本机无 Xcode 时这条**只能等 CI 才能发现**，所以必须在这里静态拦住。
+    chk("设置页未用 ARC 禁止的裸指针强转读 ivar",
+        re.search(r"\*\s*\(\s*NSArray\s*\*\s*\*\s*\)\s*\(", pm_code) is None,
+        "" if re.search(r"\*\s*\(\s*NSArray\s*\*\s*\*\s*\)\s*\(", pm_code) is None
+        else "ARC 会报 cast ... disallowed with ARC，必编译失败")
+    chk("设置页走 object_getIvar/object_setIvar 存取 ivar",
+        "object_getIvar" in pm_code and "object_setIvar" in pm_code,
+        "" if ("object_getIvar" in pm_code and "object_setIvar" in pm_code)
+        else "缺 runtime 存取路径 → 只能裸指针算术 → ARC 编译失败")
+    chk("设置页未用 ivar_getOffset 手工算指针（ARC 下必失败路径）",
+        "ivar_getOffset" not in pm_code,
+        "" if "ivar_getOffset" not in pm_code
+        else "拿到偏移后必然要裸指针算术，ARC 下编不过")
     chk("设置页重启桌面只杀 SpringBoard（不重启整机）",
         "SpringBoard" in pm and "SIGTERM" in pm_code,
         "" if ("SpringBoard" in pm and "SIGTERM" in pm_code) else "缺重启桌面实现")
