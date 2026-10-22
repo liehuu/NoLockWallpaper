@@ -138,10 +138,18 @@ for sym in com.liehuu.nolockwallpaper Enabled BlockCameraSwipe \
 done
 echo "✓ 功能指纹齐全"
 
-# 设置页产物指纹：控制器类名与配置域
-for sym in NoLockWallpaperRootListController com.liehuu.nolockwallpaper; do
+# 设置页产物指纹：控制器类名 + 载入入口 + ivar 存取方式 + 重启能力
+# ★ 这里**不查** com.liehuu.nolockwallpaper：
+#   设置页的开关读写全交给 PSSwitchCell（按 Resources/Root.plist 里的
+#   defaults + key 走 Preferences 框架），控制器代码本身完全不碰这个域名。
+#   早先版本声明过一个 kNLWDomain 常量但从未使用（-Wunused-const-variable），
+#   删掉后这条闸门就开始误报「设置页缺域名」—— 属于「改了实现没同步改判据」。
+#   域名的正确归属：dylib（读开关）+ Resources/Root.plist（写开关），
+#   两边的对齐由 tools/check_source.py 的 A7b 校验。
+for sym in NoLockWallpaperRootListController loadSpecifiersFromPlistName \
+           object_getIvar SpringBoard; do
   grep -aq "$sym" "$PREF_OUT/NoLockWallpaperPrefs" \
-    || { echo "✗ 设置页缺 ${sym}（进设置页会白屏）"; exit 1; }
+    || { echo "✗ 设置页缺 ${sym}（进设置页会白屏 / 开关不生效）"; exit 1; }
 done
 echo "✓ 设置页指纹齐全"
 
