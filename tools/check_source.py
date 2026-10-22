@@ -763,6 +763,60 @@ chk("相机滑动受子开关控制（可单独关闭）",
     re.search(r"static BOOL gBlockCameraSwipe\s*=", code) is not None,
     "压制路径含子开关 %d 处（应为 2）" %
     len(re.findall(r"gBlockCameraSwipe\s*&&\s*NLWIsCameraSwipeish", code)))
+
+# ---- 1.4-1 新增：相机手势走「description 语义」这条旁路 ----
+#
+# ★★ 为什么这一组判据必须存在（本轮真正的修复就在这里）：
+#   1.3-1 的实机日志证明，「视图树 + edges」这两个维度对相机手势**同时失效**：
+#   它挂在 UISystemGestureView（独立窗口 _UISystemGestureWindow，与锁屏窗口
+#   平行，祖先链里没有 CoverSheet/LockScreen），所以 sup 恒为 0；
+#   而 8 个边缘手势里也没有任何一个 edges 含 Right。
+#   → 修复的本质是「换一个数据源」（description），再「绕过区域判据」。
+#   这两件事在源码里都只表现为几行，很容易被后续「统一写法」顺手抹平，
+#   而抹平后编译照过、锁屏照常、只是功能悄悄退回不生效。
+#   这类「语义被抹平」的回归，只有闸门能拦。
+chk("有「按 description 认相机」判据",
+    "static BOOL NLWIsCameraGestureByDescription(UIGestureRecognizer *g)" in code)
+
+chk("有「系统手势窗口宿主」判据",
+    "static BOOL NLWIsSystemGestureHost(UIView *v)" in code,
+    "" if "static BOOL NLWIsSystemGestureHost(UIView *v)" in code
+    else "缺它就永远发现不了挂在 _UISystemGestureWindow 上的手势")
+
+_desc_refs = len(re.findall(r"NLWIsCameraGestureByDescription\s*\(", code))
+chk("两条压制路径都查了 description 判据", _desc_refs >= 3,
+    # 3 = 定义 1 处 + 调用 2 处（ProcessView / addGestureRecognizer）
+    "引用 %d 次（定义 1 + 调用 2 = 3）" % _desc_refs)
+
+chk("description 命中时绕过锁屏区域判据",
+    # ★ 正形态：camByDesc ? YES : NLWIsSuppressibleLockScreenArea(...)
+    #   这一句就是「宿主不在锁屏视图树里也能压」的唯一通道。
+    re.search(r"camByDesc\s*\?\s*YES\s*:\s*NLWIsSuppressibleLockScreenArea", code)
+    is not None,
+    "" if re.search(r"camByDesc\s*\?\s*YES\s*:", code) else
+    "改回「先过区域判据」→ 相机手势重新失效（它宿主天然不满足该判据）")
+
+chk("压制循环里 description 命中也绕过区域判据",
+    re.search(r"if\s*\(\s*camByDesc\s*\|\|", code) is not None,
+    "" if re.search(r"if\s*\(\s*camByDesc\s*\|\|", code) else
+    "循环里若写成 areaOK && camByDesc，等于没有这条旁路")
+
+chk("系统手势窗口放行但不放弃热路径优化",
+    # ★ 正形态：if (!areaOK && !NLWIsSystemGestureHost(v)) return 0;
+    #   少了后半句 = 每个视图都要取 gestureRecognizers，
+    #   didMoveToWindow 是启动期热路径，等于白分配几百次。
+    re.search(r"!\s*areaOK\s*&&\s*!\s*NLWIsSystemGestureHost\(v\)\s*\)\s*return\s+0", code)
+    is not None,
+    "" if "NLWIsSystemGestureHost(v)) return 0" in code else
+    "每个视图都取手势数组 = 启动期白分配几百次")
+
+chk("长按仍严格限定在锁屏区域（不被新旁路带偏）",
+    # ★ 反向：长按绝不能被 camByDesc 那条旁路带出去，
+    #   否则主屏图标长按、通知长按会一起被压。
+    re.search(r"if\s*\(!areaOK\)\s*continue", code) is not None,
+    "" if re.search(r"if\s*\(!areaOK\)\s*continue", code) else
+    "长按跟着走旁路 → 压掉主屏图标长按和通知长按")
+
 # 反向：绝不能出现「无条件压掉所有 pan」
 chk("没有「压掉所有 pan」的粗暴写法",
     re.search(r"NLWIsPanish\(g\)\s*\)\s*\{\s*NLWSuppressGesture", code) is None,

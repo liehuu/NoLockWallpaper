@@ -22,7 +22,15 @@ env:
   #   本版功能与 1.2-1 完全一致，只额外把真实手势现场（类名 / edges /
   #   宿主类名链 / 可压制判定 / 两个开关状态）写到两个位置，用来定位。
   #   定位完这块代码必须整块删除（Tweak.m 里标了「四点五、临时诊断」）。
-  VERSION: 1.3-1
+  # ★ 1.4-1：**修复 + 收尾诊断**。1.3-1 日志给出硬结论：
+  #   `_UISystemGestureWindow` 上 8 个边缘手势**没有任何一个 edges 含 Right**，
+  #   且所有行 sup 全 0 → 「视图树 + edges」这两个维度同时失效。
+  #   根因：相机手势挂在 UISystemGestureView（独立窗口，与锁屏窗口平行），
+  #   祖先链里没有 CoverSheet/LockScreen，任何「往上找锁屏」的判据必然落空。
+  #   本版换数据源：读手势自己的 description（含 target 类名与 action 名），
+  #   出现 camera 即压制，并绕开区域判据（理由见 Tweak.m「四之二」）。
+  #   诊断段保留一轮，万一下一轮还要定位；确认修好后再整块删除。
+  VERSION: 1.4-1
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 

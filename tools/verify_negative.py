@@ -130,8 +130,12 @@ CASES = [
     ),
     (
         "取 gestureRecognizers 提前到判据之前（热路径无谓分配）",
-        "if (!NLWIsSuppressibleLockScreenArea(v)) return 0;\n\n        NSArray *gs = v.gestureRecognizers;",
-        "NSArray *gs = v.gestureRecognizers;\n\n        if (!NLWIsSuppressibleLockScreenArea(v)) return 0;",
+        # ★ 1.4-1 更新锚点：判据已从 `if (!NLWIsSuppressibleLockScreenArea(v))`
+        #   改为 `BOOL areaOK = ...`（因为要复用到 camByDesc 旁路）。
+        #   负例相应改成「判据之前先取一次数组」—— 语义与原来完全一致。
+        "        BOOL areaOK = NLWIsSuppressibleLockScreenArea(v);",
+        "        NSArray *gs0 = v.gestureRecognizers;\n"
+        "        BOOL areaOK = NLWIsSuppressibleLockScreenArea(v);",
         "判据在取 gestureRecognizers 之前",
     ),
     (
@@ -207,6 +211,41 @@ CASES = [
         "__attribute__((constructor)) static void NLWInit(void)",
         "static void NLWLog(NSString *s) { }\n\n__attribute__((constructor)) static void NLWInit(void)",
         "源码里已无日志落盘函数",
+    ),
+    # ---- 1.4-1 新增：相机手势「description 语义」旁路的四条回归 ----
+    #
+    # 这四条覆盖的是本轮真正的修复。它们的共同点是：
+    # **改坏之后编译照过、锁屏照常、功能悄悄退回不生效** ——
+    # 属于最难靠人工发现的一类回归，必须靠闸门拦。
+    (
+        # 语义被抹平：改回「先过区域判据」
+        # → 相机手势宿主在 _UISystemGestureWindow，天然不满足该判据
+        # → 依然不生效，而且源码看起来更「整齐」
+        "description 命中后仍要求过区域判据（相机手势重新失效）",
+        "hit = camByDesc ? YES : NLWIsSuppressibleLockScreenArea((UIView *)self);",
+        "hit = NLWIsSuppressibleLockScreenArea((UIView *)self);",
+        "description 命中时绕过锁屏区域判据",
+    ),
+    (
+        "压制循环里把 camByDesc 也门在 areaOK 后面（等于没有这条旁路）",
+        "if (camByDesc ||\n",
+        "if ((areaOK && camByDesc) ||\n",
+        "压制循环里 description 命中也绕过区域判据",
+    ),
+    (
+        # ★ 这是最危险的误伤方向：长按跟着旁路走
+        # → 主屏图标长按、锁屏通知长按会一起被压
+        "长按跟着新旁路走（主屏图标长按/通知长按被误伤）",
+        "                    if (!areaOK) continue;\n",
+        "",
+        "长按仍严格限定在锁屏区域",
+    ),
+    (
+        # 功能上等价，但热路径回退：每个视图都要取一次 gestureRecognizers
+        "系统手势窗口放行时放弃热路径优化（启动期白分配几百次）",
+        "if (!areaOK && !NLWIsSystemGestureHost(v)) return 0;",
+        "if (!areaOK) return 0;",
+        "系统手势窗口放行但不放弃热路径优化",
     ),
 ]
 

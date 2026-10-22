@@ -308,6 +308,110 @@ static BOOL NLWIsCameraSwipeish(UIGestureRecognizer *g, UIView *host)
 }
 
 // ============================================================================
+//  四之二、1.4-1 新增：绕开「视图树」这条走不通的路
+// ============================================================================
+//
+// ★★ 为什么必须加这一节 —— 1.3-1 实机日志给出的硬证据（2026-10-22）：
+//
+//   148 条手势现场里，`_UISystemGestureWindow` 上共有 8 个边缘手势，
+//   **没有任何一个的 edges 含 Right(8)**：
+//
+//     SBScreenEdgePanGestureRecognizer            edges=4 / edges=1
+//     SBHomeGesturePanGestureRecognizer           edges=4 / edges=15
+//     SBCoverSheetScreenEdgePanGestureRecognizer  edges=4 ×2
+//     SBCoverSheetPresentationGestureRecognizer   edges=1
+//     SBFluidSwitcherScreenEdgePanGestureRecognizer edges=15
+//     UIScreenEdgePanGestureRecognizer            edges=15
+//
+//   而且**所有行的 sup 都是 0** —— 一个都没被认成「锁屏可压制区」。
+//
+//   这两件事合起来说明：原来的两条路同时失效。
+//
+//   ① 视图树这条路对它天然无效：
+//      相机手势挂在 `UISystemGestureView` 上，它属于独立的
+//      `_UISystemGestureWindow`，与锁屏窗口**平行**，祖先链里
+//      根本没有 CoverSheet / LockScreen / PosterBoard 字样。
+//      → 任何「沿 superview 往上找锁屏」的判据，对这个宿主必然返回 NO。
+//      这不是判据写错了，是**它所在的层级结构就绕过了这套判据**。
+//
+//   ② edges 这条路也读不出真相：
+//      SpringBoard 的 CoverSheet 边缘手势用自有子类实现，
+//      `edges` 在 add 时刻未必是真值（可能稍后才配置，
+//      也可能真正的方向存在私有字段里）。
+//      → 拿 edges 当唯一依据，等于赌「add 那一刻它已经配好」。
+//
+//   ★ 通用规律：**当一条判据在真实数据上「全线不命中」时，
+//     先怀疑判据所依赖的维度本身不存在，而不是继续调阈值。**
+//     1.3-1 之前我一直在想「edges 是 1 还是 8」，
+//     而数据显示「一个 8 都没有」—— 说明维度选错了。
+//
+// ★ 新数据源：让手势自己说它是谁。
+//   `-[UIGestureRecognizer description]` 是 NSObject 协议方法（公开、
+//   零私有符号），它内部会打印 target 的 action 名与 target 类名：
+//     target= <(action=handleCameraGesture:, target=<SBCoverSheet...>)>
+//   这把「哪个手势负责相机」交给运行时自己回答，不用猜类名。
+//
+// ★ 为什么这条判据敢绕过「可压制区」：
+//   在 description 里出现 camera 是**语义级证据**，比视图树位置更硬；
+//   而相机的边缘手势只存在于锁屏（主屏、App 内都没有这个手势），
+//   所以不会扩散到别处。其余手势仍走原来的保守判据，一点不放松。
+
+/// 宿主是否「系统全局手势窗口里的视图」。
+///
+/// ★ 单独认这一层的原因见上：相机手势的宿主在这里，
+///   而这里恰恰是「锁屏视图树判据」覆盖不到的地方。
+static BOOL NLWIsSystemGestureHost(UIView *v)
+{
+    if (!v) return NO;
+    @try {
+        // 类链含 UISystemGestureView（自身或子类）
+        if (NLWChainHas(v, "SystemGestureView")) return YES;
+        // 所在窗口是 _UISystemGestureWindow
+        UIWindow *w = v.window;
+        if (w && NLWChainHas(w, "SystemGestureWindow")) return YES;
+    } @catch (NSException *e) { }
+    return NO;
+}
+
+/// 手势的 description 里是否出现 camera。
+///
+/// ★ 只对滑动类调用：description 会构造字符串，点击/长按没必要付这个成本。
+/// ★ 截断到 400 字符：防某些实现拼出超长串拖慢主线程。
+/// ★ 全程 @try：description 是系统实现，任何异常都不允许外泄。
+///
+/// ★ 函数名沿用「ByDescription」，但实际做两件事（双保险）：
+///   ① 类名自带 Camera —— 某些系统版本会用 SBCameraSwipeGestureRecognizer
+///      这类专用类，这一条零成本且不可能误判。
+///   ② description 里出现 camera —— 覆盖 action 名 / target 类名带 camera
+///      的情况（description 会把 target 的 action 名一起打出来）。
+///   两条任一命中即认定。②是主力，①是 ②换不来时的兜底。
+static BOOL NLWIsCameraGestureByDescription(UIGestureRecognizer *g)
+{
+    if (!g) return NO;
+    @try {
+        if (!NLWIsPanish(g)) return NO;
+
+        // ① 类名自带 Camera（零成本，不会误判）
+        @try {
+            const char *cn = class_getName(object_getClass(g));
+            if (cn && strstr(cn, "Camera")) return YES;
+        } @catch (NSException *e) { }
+
+        // ② description 里出现 camera
+        NSString *d = [g description];
+        if (![d isKindOfClass:[NSString class]]) return NO;
+        if (d.length == 0) return NO;
+        if (d.length > 400) d = [d substringToIndex:400];
+
+        // 小写后查 camera，覆盖 Camera / camera / CAMERA 各种命名习惯
+        if ([[d lowercaseString] rangeOfString:@"camera"].location != NSNotFound) {
+            return YES;
+        }
+    } @catch (NSException *e) { }
+    return NO;
+}
+
+// ============================================================================
 //  四点五、临时诊断（1.3-1 专用；定位完必须整块删除）
 // ============================================================================
 //
@@ -467,13 +571,32 @@ static void NLWDiagNoteGesture(UIGestureRecognizer *g, UIView *host, const char 
         //   多一处会让计数失真）；二是没必要 —— 判据是否命中完全可以从
         //   这里记录的原始事实（类名 / edges / sup）推出来，而原始事实
         //   才是真正要拿到的数据。
+        // ★ 1.4-1 新增：把手势自己的 description 也记下来。
+        //   这是本轮唯一能回答「这个手势到底是谁的」的数据源 ——
+        //   它内部带 target 的 action 名与 target 类名。
+        NSString *desc = @"-";
+        @try {
+            if (NLWIsPanish(g)) {
+                NSString *d = [g description];
+                if ([d isKindOfClass:[NSString class]] && d.length) {
+                    if (d.length > 320) d = [d substringToIndex:320];
+                    // 压成一行，避免破坏「一行一条记录」的解析
+                    desc = [d stringByReplacingOccurrencesOfString:@"\n"
+                                                        withString:@" "];
+                }
+            }
+        } @catch (NSException *e) { }
+
         NSString *line = [NSString stringWithFormat:
-            @"[%@] cls=%s edge=%d edges=%@ sup=%d gEn=%d camSw=%d\n"
+            @"[%@] cls=%s edge=%d edges=%@ sup=%d sysHost=%d gEn=%d camSw=%d\n"
+            @"     desc=%@\n"
             @"     chain=%@",
             (tagStr ? tagStr : @"?"),
             (cn ? cn : "?"), (int)isEdge, edges,
             (int)NLWIsSuppressibleLockScreenArea(host),
+            (int)NLWIsSystemGestureHost(host),
             (int)gEnabled, (int)gBlockCameraSwipe,
+            (desc ? desc : @"-"),
             [chain componentsJoinedByString:@" > "]];
         NLWDiagAdd(line);
     } @catch (NSException *e) { }
@@ -636,7 +759,15 @@ static NSUInteger NLWProcessView(UIView *v)
         //   空数组而非 nil，仍会分配）。didMoveToWindow 是所有视图上屏的
         //   热路径，SpringBoard 启动期几百个视图各走一遍 —— 先取数组等于
         //   白分配几百次。判据只是类名比对，纳秒级且零分配，所以提到前面。
-        if (!NLWIsSuppressibleLockScreenArea(v)) return 0;
+        BOOL areaOK = NLWIsSuppressibleLockScreenArea(v);
+
+        // ★ 1.4-1：多一个放行口，但**不放弃上面的性能优化**。
+        //   相机手势挂在 `UISystemGestureView` 上，它所在的
+        //   `_UISystemGestureWindow` 与锁屏窗口平行，areaOK 恒为 NO ——
+        //   这一路是被视图结构绕过的，不是判据写错。
+        //   所以：不在可压制区时，只对「系统手势窗口里的宿主」继续往下走，
+        //   其余视图依然在这里就返回，热路径开销与改动前完全一致。
+        if (!areaOK && !NLWIsSystemGestureHost(v)) return 0;
 
         NSArray *gs = v.gestureRecognizers;
         if (gs.count == 0) return 0;
@@ -650,11 +781,20 @@ static NSUInteger NLWProcessView(UIView *v)
                 NLWDiagNoteGesture(g, v, "scan");
 
                 if (NLWIsLongPressish(g)) {
+                    // ★ 长按类仍然严格限定在「锁屏可压制区」。
+                    //   放宽到系统手势窗口会把主屏图标长按、通知长按一起带走。
+                    if (!areaOK) continue;
                     NLWSuppressGesture(g);
                     n++;
                     continue;
                 }
-                if (gBlockCameraSwipe && NLWIsCameraSwipeish(g, v)) {
+
+                // ★ 1.4-1：先看手势自己有没有承认是相机。
+                //   这一条不看宿主位置，因为宿主位置这条路已被证明走不通。
+                BOOL camByDesc = (gBlockCameraSwipe &&
+                                  NLWIsCameraGestureByDescription(g));
+                if (camByDesc ||
+                    (areaOK && gBlockCameraSwipe && NLWIsCameraSwipeish(g, v))) {
                     NLWSuppressGesture(g);
                     n++;
                 }
@@ -786,9 +926,18 @@ static void NLWAddGestureRecognizer(id self, SEL _cmd, UIGestureRecognizer *g)
         // ★ 手势类型判断统一走 NLWIsLongPressish / NLWIsCameraSwipeish，
         //   与后面的压制循环用同一判据。两处各写一套迟早会不一致
         //   （一处放宽一处没放宽 → 判为命中却一个都没压，或者反过来漏压）。
-        if (gEnabled && (NLWIsLongPressish(g) ||
+        //
+        // ★ 1.4-1：新增「手势自己承认是相机」这条旁路（camByDesc）。
+        //   它是唯一能绕过「锁屏视图树」判据的口子，理由见
+        //   「四之二」小节 —— 相机手势的宿主根本不在锁屏视图树里。
+        //   注意：camByDesc 命中时 hit 直接为 YES，不再要求区域判据。
+        BOOL camByDesc = NO;
+        if (gEnabled && gBlockCameraSwipe) {
+            camByDesc = NLWIsCameraGestureByDescription(g);
+        }
+        if (gEnabled && (NLWIsLongPressish(g) || camByDesc ||
                          (gBlockCameraSwipe && NLWIsCameraSwipeish(g, (UIView *)self)))) {
-            hit = NLWIsSuppressibleLockScreenArea((UIView *)self);
+            hit = camByDesc ? YES : NLWIsSuppressibleLockScreenArea((UIView *)self);
         }
     } @catch (NSException *e) { }
 
