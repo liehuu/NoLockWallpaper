@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>entry</key>
+	<dict>
+		<!-- ★ cell 必须是 PSLinkCell：点击后跳进下层页面 -->
+		<key>cell</key>
+		<string>PSLinkCell</string>
+		<!-- ★ bundle 必须与 PreferenceBundles 下的 .bundle 基础名一致，
+		       写错 = 点了没反应或白屏。 -->
+		<key>bundle</key>
+		<string>NoLockWallpaperPrefs</string>
+		<!-- ★ detail 必须等于 Info.plist 的 NSPrincipalClass。
+		       两者不一致会让设置 App 找不到控制器。 -->
+		<key>detail</key>
+		<string>NoLockWallpaperRootListController</string>
+		<key>isController</key>
+		<true/>
+		<!-- ★ label 是设置列表里显示的名字 -->
+		<key>label</key>
+		<string>NoLockWallpaper</string>
+		<!-- ★ icon 写基础名 icon.png。实际放 icon@2x.png / icon@3x.png，
+		       系统会自己按屏选。写成 icon@2x.png 反而可能不显示。 -->
+		<key>icon</key>
+		<string>icon.png</string>
+	</dict>
+</dict>
+</plist>

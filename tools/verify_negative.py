@@ -22,6 +22,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SRC = os.path.join(ROOT, "Tweak.m")
 BUILD_SH = os.path.join(ROOT, "devkit", "build.sh")
+MKDEB_SH = os.path.join(ROOT, "devkit", "mkdeb.sh")
+PREF_M = os.path.join(ROOT, "NoLockWallpaperPrefs",
+                      "NoLockWallpaperRootListController.m")
 CHK = os.path.join(HERE, "check_source.py")
 
 PY = sys.executable
@@ -45,13 +48,41 @@ def run_check_build_sh(mutated_text):
       NLW_BUILD_OVERRIDE 读到它。这样才能证明那几条判据真的会 FAIL ——
       否则又是「检查项没在跑还报绿」。
     """
-    tmpdir = tempfile.mkdtemp(prefix="nlw_neg_bd_")
+    return _run_with_override("NLW_BUILD_OVERRIDE", "build.sh", mutated_text)
+
+
+def run_check_pref_m(mutated_text):
+    """用替换过的设置页控制器源码跑自检。
+
+    ★ 设置页跑在「设置」App 进程里，一旦它崩，用户连开关都进不去 ——
+      严重性不低于崩 SpringBoard。所以「Preferences 七坑」那几条判据
+      同样必须做反向验证，证明它们真的会 FAIL。
+    """
+    return _run_with_override("NLW_PREF_OVERRIDE",
+                              "NoLockWallpaperRootListController.m", mutated_text)
+
+
+def _write(tmpdir, filename, text):
+    """把文本写到临时文件，返回路径（供需要传路径的检查器使用）。"""
+    path = os.path.join(tmpdir, filename)
+    with io.open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    return path
+
+
+def run_check_mkdeb(mutated_text):
+    """用替换过的 mkdeb.sh 跑自检（设置页载荷类判据）。"""
+    return _run_with_override("NLW_MKDEB_OVERRIDE", "mkdeb.sh", mutated_text)
+
+
+def _run_with_override(env_key, filename, mutated_text):
+    tmpdir = tempfile.mkdtemp(prefix="nlw_neg_ov_")
     try:
-        target = os.path.join(tmpdir, "build.sh")
+        target = os.path.join(tmpdir, filename)
         with io.open(target, "w", encoding="utf-8", newline="\n") as f:
             f.write(mutated_text)
         env = dict(os.environ)
-        env["NLW_BUILD_OVERRIDE"] = target
+        env[env_key] = target
         p = subprocess.run([PY, CHK], capture_output=True, text=True,
                            encoding="utf-8", errors="replace", env=env)
         out = (p.stdout or "") + (p.stderr or "")
@@ -116,6 +147,56 @@ CASES = [
         "((void (*)(id, SEL, id))gOrigAddGesture)(self, _cmd, g);",
         "gOrigAddGesture 每次调用前都判空",
     ),
+
+    # ---------------- 1.1 新增：开关与相机滑动 ----------------
+    (
+        "开关改成把「键不存在」当 false（装完直接不生效）",
+        "if (present) on = (v != 0);",
+        "on = (v != 0);",
+        "键缺失时按开启处理",
+    ),
+    (
+        "删掉恢复已压制手势的逻辑（关掉开关等于没关）",
+        "static void NLWRestoreAllSuppressed(void)\n{",
+        "static void NLWRestoreAllSuppressed_UNUSED(void)\n{",
+        "有恢复函数 NLWRestoreAllSuppressed 的定义",
+    ),
+    (
+        "恢复时无条件设 enabled=YES（擅自打开系统本已关闭的手势）",
+        "g.enabled = [en boolValue];",
+        "g.enabled = YES;",
+        "恢复时还原**原始** enabled",
+    ),
+    (
+        "允许反复覆盖「原状」（关掉后长按仍是 90 秒）",
+        "if ([gSuppressed objectForKey:g] == nil) {",
+        "if (YES) {",
+        "记录原状时只在首次记录",
+    ),
+    (
+        "去掉右边缘限定（上滑解锁会被一起废掉）",
+        "if (e & UIRectEdgeRight) return YES;",
+        "if (e) return YES;",
+        "判据要求 UIRectEdgeRight",
+    ),
+    (
+        "相机滑动不看子开关（无法单独关闭）",
+        "gBlockCameraSwipe && NLWIsCameraSwipeish(g, (UIView *)self)",
+        "NLWIsCameraSwipeish(g, (UIView *)self)",
+        "相机滑动受子开关控制",
+    ),
+    (
+        "通知回调不切主线程（改 UI 相关对象有风险）",
+        "dispatch_async(dispatch_get_main_queue(), ^{",
+        "if (1) {",
+        "通知回调切回主线程",
+    ),
+    (
+        "把日志加回去（热路径写盘，watchdog 会杀进程）",
+        "__attribute__((constructor)) static void NLWInit(void)",
+        "static void NLWLog(NSString *s) { }\n\n__attribute__((constructor)) static void NLWInit(void)",
+        "源码里已无日志落盘函数",
+    ),
 ]
 
 # ★ B 组：构建闸门本身的判据写错（真实误报过一次，潜伏三个 run 才暴露）
@@ -141,12 +222,146 @@ BUILD_CASES = [
         "LockScreen; do",
         "指纹列表覆盖锁屏类名判据关键串",
     ),
+    (
+        "指纹列表漏掉 edge pan 判据（禁相机失效不会被发现）",
+        "for sym in UIScreenEdgePanGestureRecognizer edges Camera; do",
+        "for sym in Camera; do",
+        "指纹列表覆盖 edge pan 判据",
+    ),
+    (
+        "指纹列表漏掉 BlockCameraSwipe（相机子开关失效不会被发现）",
+        "for sym in com.liehuu.nolockwallpaper Enabled BlockCameraSwipe \\",
+        "for sym in com.liehuu.nolockwallpaper Enabled \\",
+        "指纹列表覆盖配置域名与两个开关键",
+    ),
+    (
+        "设置页产物不做架构校验（装了设置页白屏也发现不了）",
+        'xcrun lipo -info "$PREF_OUT/NoLockWallpaperPrefs" | grep -q "$CPU"',
+        'echo skip',
+        "设置页产物也过架构闸门",
+    ),
+    (
+        "退回不存在的段名 __objc_exception（判据永远不生效）",
+        'grep -q \'__gcc_except_tab\'',
+        'grep -q \'__objc_exception\'',
+        "build.sh 用 __gcc_except_tab 判 @try 生效",
+    ),
 ]
+
+# ★ C 组：设置页控制器源码（跑在「设置」App 进程里，崩了用户连开关都进不去）
+PREF_CASES = [
+    (
+        "自己声明 _specifiers ivar（偏移与真实布局错位 → 崩设置 App）",
+        "@implementation NoLockWallpaperRootListController\n",
+        "@implementation NoLockWallpaperRootListController\n"
+        "{\n    NSArray *_specifiers;\n}\n",
+        "设置页未自己声明 _specifiers ivar",
+    ),
+    (
+        "引用 UIColorWell（iOS 13 设置 App 直接打不开）",
+        "- (void)viewDidLoad",
+        "- (Class)nlwX { return [UIColorWell class]; }\n\n- (void)viewDidLoad",
+        "设置页未引用 UIColorWell",
+    ),
+    (
+        "用 reloadSpecifier:nil（会崩）",
+        "        self.title = @\"NoLockWallpaper\";",
+        "        [self reloadSpecifier:nil animated:NO];\n        self.title = @\"NoLockWallpaper\";",
+        "设置页未调用 reloadSpecifier:nil",
+    ),
+    (
+        "不实现 specifiers（用户看到整块空白）",
+        "- (NSArray *)specifiers\n{",
+        "- (NSArray *)specifiersDisabled\n{",
+        "设置页自己实现了 specifiers",
+    ),
+    (
+        "用没证据的 notify_post 通知名（点了可能没反应）",
+        "        // 软杀：让 SpringBoard 有机会正常退出，比 SIGKILL 干净",
+        "        notify_post(\"com.apple.springboard.respring\");\n"
+        "        // 软杀：让 SpringBoard 有机会正常退出，比 SIGKILL 干净",
+        "设置页未用没证据的 notify_post 通知名",
+    ),
+]
+
+# ★ D 组：mkdeb.sh（设置页载荷类）
+MKDEB_CASES = [
+    (
+        "漏拷设置页可执行文件（设置页白屏）",
+        'cp "$ROOT/.build/$PREFNAME.bundle/$PREFNAME" "$PREFBUNDLE/"',
+        'echo skip-pref-exec',
+        "真的把设置页可执行文件拷进 PreferenceBundles",
+    ),
+    (
+        "漏写 PreferenceLoader 入口 plist（设置里根本不显示本插件）",
+        '          "$PREFENTRY/Root.plist" <<\'PYPLIST\'',
+        '          "/tmp/nlw_no_entry.plist" <<\'PYPLIST\'',
+        "真的写了 PreferenceLoader 入口 plist",
+    ),
+    (
+        "PREFBUNDLE 指错目录（资源全落到别处，设置页打不开）",
+        'PREFBUNDLE="$STAGE/Library/PreferenceBundles/$PREFNAME.bundle"',
+        'PREFBUNDLE="$STAGE/Library/PreferenceBundlesX/$PREFNAME.bundle"',
+        "PREFBUNDLE 指向 PreferenceBundles",
+    ),
+    (
+        "入口 plist 不转二进制（部分版本 PreferenceLoader 不认）",
+        "    plistlib.dump(obj, f, fmt=plistlib.FMT_BINARY)",
+        "    plistlib.dump(obj, f)",
+        "入口 plist 转二进制",
+    ),
+    (
+        "control 丢掉 preferenceloader 依赖（纯净设备看不到设置页）",
+        "Depends: mobilesubstrate, preferenceloader",
+        "Depends: mobilesubstrate",
+        "control 依赖 preferenceloader",
+    ),
+    (
+        "图标只打包 @2x/@3x 漏掉基础名（部分版本显示空白方块）",
+        "for _ic in icon.png icon@2x.png icon@3x.png; do",
+        "for _ic in icon@2x.png icon@3x.png; do",
+        "三个尺寸图标一起打包",
+    ),
+]
+
+
+def _run_group(label, cases, orig_text, runner, tmpdir, fails):
+    """跑一组「原地替换源码 → 期望自检 FAIL」的用例。返回本组用例数。"""
+    n = 0
+    for idx, (name, old, new, expect) in enumerate(cases, 1):
+        n += 1
+        if old not in orig_text:
+            print("[%s%d] SKIP  %s" % (label, idx, name))
+            print("      原因：源码里找不到要替换的片段（用例本身过期了，需更新）")
+            fails.append("%s（用例片段过期）" % name)
+            continue
+
+        mutated = orig_text.replace(old, new, 1)
+        if mutated == orig_text:
+            print("[%s%d] SKIP  %s（替换无效）" % (label, idx, name))
+            fails.append("%s（替换无效）" % name)
+            continue
+
+        ok2, out2 = runner(mutated)
+        blocked = (not ok2) and (expect in out2)
+        status = "OK   已拦截" if blocked else "!! 漏放"
+        print("[%s%d] %s  %s" % (label, idx, status, name))
+        if not blocked:
+            fails.append(name)
+            # 打印诊断：是没失败，还是失败在别的检查项上
+            if ok2:
+                print("      -> 自检居然全过：这条判据没有生效")
+            else:
+                tail = [l for l in out2.splitlines() if l.strip().startswith("- ")]
+                print("      -> 失败了但不是期望的那项，实际失败：%s" % tail)
+    return n
 
 
 def main():
     original = io.open(SRC, encoding="utf-8").read()
     build_sh_orig = io.open(BUILD_SH, encoding="utf-8").read()
+    pref_m_orig = io.open(PREF_M, encoding="utf-8").read()
+    mkdeb_orig = io.open(MKDEB_SH, encoding="utf-8").read()
 
     ok, out = run_check(SRC)
     print("=" * 70)
@@ -168,58 +383,18 @@ def main():
     tmpdir = tempfile.mkdtemp(prefix="nlw_neg_")
     try:
         # ---------- A 组：改 Tweak.m ----------
-        for idx, (name, old, new, expect) in enumerate(CASES, 1):
-            total += 1
-            if old not in original:
-                print("[A%d] SKIP  %s" % (idx, name))
-                print("      原因：源码里找不到要替换的片段（用例本身过期了，需更新）")
-                fails.append("%s（用例片段过期）" % name)
-                continue
-
-            mutated = original.replace(old, new, 1)
-            if mutated == original:
-                print("[A%d] SKIP  %s（替换无效）" % (idx, name))
-                fails.append("%s（替换无效）" % name)
-                continue
-
-            path = os.path.join(tmpdir, "Tweak_neg_%02d.m" % idx)
-            with io.open(path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(mutated)
-
-            ok2, out2 = run_check(path)
-            blocked = (not ok2) and (expect in out2)
-            status = "OK   已拦截" if blocked else "!! 漏放"
-            print("[A%d] %s  %s" % (idx, status, name))
-            if not blocked:
-                fails.append(name)
-                # 打印诊断：是没失败，还是失败在别的检查项上
-                if ok2:
-                    print("      -> 自检居然全过：这条判据没有生效")
-                else:
-                    tail = [l for l in out2.splitlines() if l.strip().startswith("- ")]
-                    print("      -> 失败了但不是期望的那项，实际失败：%s" % tail)
-
-        # ---------- B 组：改 build.sh（构建闸门类判据） ----------
-        for idx, (name, old, new, expect) in enumerate(BUILD_CASES, 1):
-            total += 1
-            if old not in build_sh_orig:
-                print("[B%d] SKIP  %s" % (idx, name))
-                print("      原因：build.sh 里找不到要替换的片段（用例过期）")
-                fails.append("%s（构建用例片段过期）" % name)
-                continue
-
-            mutated = build_sh_orig.replace(old, new, 1)
-            ok2, out2 = run_check_build_sh(mutated)
-            blocked = (not ok2) and (expect in out2)
-            status = "OK   已拦截" if blocked else "!! 漏放"
-            print("[B%d] %s  %s" % (idx, status, name))
-            if not blocked:
-                fails.append(name)
-                if ok2:
-                    print("      -> 自检居然全过：这条判据没有生效")
-                else:
-                    tail = [l for l in out2.splitlines() if l.strip().startswith("- ")]
-                    print("      -> 失败了但不是期望的那项，实际失败：%s" % tail)
+        total += _run_group("A", CASES, original,
+                            lambda t: run_check(_write(tmpdir, "Tweak_neg.m", t)),
+                            tmpdir, fails)
+        # ---------- B 组：改 build.sh ----------
+        total += _run_group("B", BUILD_CASES, build_sh_orig,
+                            run_check_build_sh, tmpdir, fails)
+        # ---------- C 组：改设置页控制器 ----------
+        total += _run_group("C", PREF_CASES, pref_m_orig,
+                            run_check_pref_m, tmpdir, fails)
+        # ---------- D 组：改 mkdeb.sh ----------
+        total += _run_group("D", MKDEB_CASES, mkdeb_orig,
+                            run_check_mkdeb, tmpdir, fails)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 

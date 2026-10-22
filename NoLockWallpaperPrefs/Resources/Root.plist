@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>title</key>
+	<string>NoLockWallpaper</string>
+	<key>items</key>
+	<array>
+
+		<!-- ============================================================
+		     组 1：功能开关
+		     ★ defaults 必须与 Tweak.m 的 NLWPrefsDomain 完全一致，
+		       否则开关写到一个域、插件读另一个域 → 开关完全无效。
+		     ★ key 必须与 Tweak.m 的 NLWEnabledKey / NLWBlockCameraKey 一致。
+		     ★ PostNotification 必须与 Tweak.m 的 NLWChangedNotification 一致
+		       （插件靠它做「关掉即时生效」）。
+		     ============================================================ -->
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>功能</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>禁用锁屏长按换壁纸</string>
+			<key>defaults</key>
+			<string>com.liehuu.nolockwallpaper</string>
+			<key>key</key>
+			<string>Enabled</string>
+			<key>default</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.liehuu.nolockwallpaper/changed</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>禁用锁屏左滑进相机</string>
+			<key>defaults</key>
+			<string>com.liehuu.nolockwallpaper</string>
+			<key>key</key>
+			<string>BlockCameraSwipe</string>
+			<key>default</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.liehuu.nolockwallpaper/changed</string>
+		</dict>
+
+		<!-- ============================================================
+		     组 2：生效说明
+		     ★ 把「关掉立即生效 / 打开需要重启桌面」这个不对称性写清楚。
+		       用户看不到这条，就会认为开关坏了。
+		     ============================================================ -->
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>生效方式</string>
+			<key>footerText</key>
+			<string>关闭开关：立即生效，锁屏长按/左滑会马上恢复原样。&#10;打开开关：需要点下方「重启桌面」，因为锁屏页面此时已经建好了，插件只能等它下次重建时才能拦下。</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSButtonCell</string>
+			<key>label</key>
+			<string>重启桌面</string>
+			<key>action</key>
+			<string>respring</string>
+			<key>confirmation</key>
+			<dict>
+				<key>title</key>
+				<string>重启桌面</string>
+				<key>prompt</key>
+				<string>桌面会短暂黑屏并自动恢复，期间不要操作手机。是否继续？</string>
+				<key>okTitle</key>
+				<string>重启</string>
+				<key>cancelTitle</key>
+				<string>取消</string>
+			</dict>
+		</dict>
+
+		<!-- ============================================================
+		     组 3：说明
+		     ============================================================ -->
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>说明</string>
+			<key>footerText</key>
+			<string>不会影响：主屏图标长按、锁屏通知长按、手电筒/相机按钮长按、上滑解锁、下拉通知中心。&#10;查看版本：设置 → 通用 → iPhone 储存空间 → NoLockWallpaper。</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>应急停用</string>
+			<key>footerText</key>
+			<string>如果设置打不开或桌面异常，用文件管理器创建空文件：&#10;/var/mobile/Library/Preferences/com.liehuu.nlw.disabled&#10;然后重启桌面，插件将完全不再动手。删掉该文件即恢复。</string>
+		</dict>
+
+	</array>
+</dict>
+</plist>

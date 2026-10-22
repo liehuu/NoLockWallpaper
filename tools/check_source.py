@@ -14,6 +14,7 @@
 """
 import os
 import re
+import struct
 import sys
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,7 +25,9 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.environ.get("NLW_SRC_OVERRIDE") or os.path.join(_REPO, "Tweak.m")
 # ★ 同理支持替换 build.sh：反向验证要证明「构建闸门判据写错会 FAIL」。
 BUILD = os.environ.get("NLW_BUILD_OVERRIDE") or os.path.join(_REPO, "devkit", "build.sh")
-MKDEB = os.path.join(_REPO, "devkit", "mkdeb.sh")
+# ★ 同上：设置页控制器的反向验证需要替换这份源码。
+PREFM_OVERRIDE = os.environ.get("NLW_PREF_OVERRIDE")
+MKDEB = os.environ.get("NLW_MKDEB_OVERRIDE") or os.path.join(_REPO, "devkit", "mkdeb.sh")
 PLIST = os.path.join(_REPO, "NoLockWallpaper.plist")
 
 fails, oks = [], []
@@ -409,11 +412,21 @@ chk("只 hook 了公开 API", not extra, "多出的：%s" % extra if extra else
 # =====================================================================
 print("\n[A7] 热路径零 IO（watchdog 会杀进程）")
 
-# 日志调用点必须少，且 NLWLog 内部不能在循环里
+# ★ 1.1 起日志已整体移除（用户要求：功能验证通过后，诊断代码只剩负担）。
+#   判据改为「必须没有日志」——这是正向要求，不是「数量够少」。
+#   为什么改成硬性禁止：日志写在视图上屏热路径上是本项目明令禁止的做法，
+#   留一个「允许 <= 5 处」的口子，等于给出一个随时可以重新踩坑的许可。
 log_calls = [i for i, l in enumerate(code_lines, 1) if "NLWLog(" in l]
-chk("NLWLog 调用点 <= 5", len(log_calls) <= 5, "实际 %d 处：%s" % (len(log_calls), log_calls))
+chk("源码里已无 NLWLog 调用", not log_calls,
+    "仍残留 %d 处：%s" % (len(log_calls), log_calls) if log_calls else "")
+chk("源码里已无日志落盘函数", "NLWLogDir" not in code,
+    "" if "NLWLogDir" not in code else "日志目录探测代码仍在")
+chk("源码里已无 iOS 版本探测", "NLWiOSVersion" not in code,
+    "" if "NLWiOSVersion" not in code else "诊断用的版本探测仍在")
+chk("源码里已无手势清单 dump", "gLoggedInventory" not in code,
+    "" if "gLoggedInventory" not in code else "诊断用手势清单 dump 仍在")
 
-# NLWProcessView 里不能直接写日志（只能通过 gLoggedInventory 门控）
+# 热路径里不得出现任何文件/偏好读取
 m = re.search(r"static NSUInteger NLWProcessView\(", code)
 if m:
     start = m.end() - 1
@@ -427,9 +440,245 @@ if m:
                 break
         i += 1
     body = code[start:i + 1]
-    chk("NLWProcessView 内日志有 gLoggedInventory 门控",
-        ("NLWLog(" not in body) or ("if (!gLoggedInventory)" in body),
-        "" if ("NLWLog(" not in body or "if (!gLoggedInventory)" in body) else "无门控 = 每次都写盘")
+    chk("NLWProcessView 内无 CFPreferences 读取",
+        "CFPreferences" not in body,
+        "" if "CFPreferences" not in body else "热路径读配置 = syscall + plist 解析")
+    chk("NLWProcessView 内无文件 IO",
+        not any(k in body for k in ("writeToFile", "fileHandle", "NSFileManager",
+                                    "stringWithContentsOfFile")),
+        "" if not any(k in body for k in ("writeToFile", "fileHandle", "NSFileManager"))
+        else "热路径有文件 IO")
+
+# =====================================================================
+print("\n[A7b] 开关：读取、实时生效、与 plist 三方一致")
+
+# ★★ 这一组是 1.1 新增的核心功能。判据要覆盖三类「装了等于没装」的失败：
+#   ① 插件根本不读开关 → 设置页是个摆设
+#   ② 插件读的域/键与 Root.plist 不一致 → 开关拨了没反应
+#   ③ 关掉后不恢复已压制的手势 → 用户以为开关坏了
+
+chk("有开关读取函数 NLWReadBool", "static BOOL NLWReadBool" in code)
+chk("有开关装载函数 NLWLoadSwitches", "static void NLWLoadSwitches" in code)
+chk("开关状态存在内存变量（热路径不读配置）",
+    re.search(r"static BOOL gEnabled\s*=\s*YES", code) is not None)
+chk("有相机滑动子开关变量 gBlockCameraSwipe",
+    re.search(r"static BOOL gBlockCameraSwipe\s*=\s*YES", code) is not None)
+
+# ① 真的读了配置
+chk("开关真的读 CFPreferencesGetAppBooleanValue",
+    "CFPreferencesGetAppBooleanValue" in code)
+chk("读配置前有 AppSynchronize（否则拿到旧缓存）",
+    "CFPreferencesAppSynchronize" in code)
+chk("键缺失时按开启处理（not present 不覆盖 fallback）",
+    re.search(r"if \(present\)", code) is not None,
+    "" if re.search(r"if \(present\)", code) else "把「键不存在」当成 false = 装完不生效")
+
+# ② 域与键必须与 Root.plist 一致
+#    ★ 这类不一致完全不报错，只表现为「开关没反应」，必须静态对齐。
+ROOTPL = os.path.join(_REPO, "NoLockWallpaperPrefs", "Resources", "Root.plist")
+INFOPL = os.path.join(_REPO, "NoLockWallpaperPrefs", "Resources", "Info.plist")
+ENTRYPL = os.path.join(_REPO, "NoLockWallpaperPrefs", "layout",
+                       "Library", "PreferenceLoader", "Preferences",
+                       "NoLockWallpaperPrefs", "Root.plist")
+
+for p in (ROOTPL, INFOPL, ENTRYPL):
+    chk("设置页文件存在 %s" % os.path.basename(os.path.dirname(p)) + "/" +
+        os.path.basename(p), os.path.isfile(p))
+
+if os.path.isfile(ROOTPL):
+    rp = open(ROOTPL, encoding="utf-8").read()
+    # Tweak.m 里的域名/键名都写成字符串字面量，必须查 src 而不是 code
+    m_dom = re.search(r'NLWPrefsDomain\s*=\s*@"([^"]+)"', src)
+    m_en  = re.search(r'NLWEnabledKey\s*=\s*@"([^"]+)"', src)
+    m_cam = re.search(r'NLWBlockCameraKey\s*=\s*@"([^"]+)"', src)
+    m_ntf = re.search(r'NLWChangedNotification\s*=\s*@"([^"]+)"', src)
+    dom = m_dom.group(1) if m_dom else None
+    en  = m_en.group(1) if m_en else None
+    cam = m_cam.group(1) if m_cam else None
+    ntf = m_ntf.group(1) if m_ntf else None
+
+    chk("能解析出 Tweak.m 的配置域名", dom is not None, "解析失败则判据无效")
+    chk("能解析出 Tweak.m 的两个键名", en is not None and cam is not None)
+    chk("能解析出 Tweak.m 的通知名", ntf is not None)
+
+    if dom:
+        chk("Root.plist 的 defaults 与 Tweak.m 域名一致",
+            ("<string>%s</string>" % dom) in rp,
+            "" if ("<string>%s</string>" % dom) in rp else "域名不一致 → 开关无效")
+    if en:
+        chk("Root.plist 含 Enabled 键 %r" % en, ("<string>%s</string>" % en) in rp)
+    if cam:
+        chk("Root.plist 含相机键 %r" % cam, ("<string>%s</string>" % cam) in rp)
+
+    chk("Root.plist 用 PSSwitchCell", "PSSwitchCell" in rp)
+    chk("Root.plist 有 PSButtonCell（重启桌面按钮）", "PSButtonCell" in rp)
+    chk("Root.plist 的重启动作指向 respring",
+        re.search(r"<key>action</key>\s*<string>respring</string>", rp) is not None)
+
+    # ③ 通知名三方一致：Tweak.m 监听名 == Root.plist 的 PostNotification
+    if ntf:
+        chk("通知名在 Root.plist 里出现（PostNotification 对齐）",
+            ("<string>%s</string>" % ntf) in rp,
+            "" if ("<string>%s</string>" % ntf) in rp
+            else "通知名不一致 → 关开关不会立即生效")
+        chk("Tweak.m 注册了 Darwin 通知监听",
+            "CFNotificationCenterAddObserver" in code and
+            "CFNotificationCenterGetDarwinNotifyCenter" in code)
+        chk("通知回调切回主线程再改手势",
+            "dispatch_async(dispatch_get_main_queue()" in code,
+            "" if "dispatch_async(dispatch_get_main_queue()" in code
+            else "通知回调不保证主线程，直接改 UI 相关对象有风险")
+
+    # ④ 关掉时必须恢复已压制的手势，否则开关是假的
+    # ★ 判据必须同时查「有定义」和「有调用」。
+    #   第一版只查 `"NLWRestoreAllSuppressed" in code`，
+    #   把函数改名后调用点还在 → 判据照样命中 → 假通过。
+    #   反向验证 A11 实测漏放，正是这个原因。
+    #   「有名无实」和「有实无名」都是缺陷，必须两样都在。
+    chk("有恢复函数 NLWRestoreAllSuppressed 的定义",
+        re.search(r"static void NLWRestoreAllSuppressed\(void\)\s*\{", code) is not None,
+        "" if re.search(r"static void NLWRestoreAllSuppressed\(void\)\s*\{", code)
+        else "只剩调用点、没有实现 → 链接期或运行期直接失效")
+    chk("开关切到关闭时真的调用了恢复函数",
+        re.search(r"NLWRestoreAllSuppressed\(\);", code) is not None,
+        "" if re.search(r"NLWRestoreAllSuppressed\(\);", code) else "定义了却没人调 = 开关失效")
+    chk("恢复时还原**原始** enabled（不是无条件 YES）",
+        re.search(r"g\.enabled = \[en boolValue\]", code) is not None,
+        "" if re.search(r"g\.enabled = \[en boolValue\]", code)
+        else "无条件设 YES 会擅自打开系统本已关闭的手势")
+    chk("记录原状时只在首次记录（不覆盖成已改后的值）",
+        re.search(r"if \(\[gSuppressed objectForKey:g\] == nil\)", code) is not None,
+        "" if re.search(r"if \(\[gSuppressed objectForKey:g\] == nil\)", code)
+        else "反复覆盖会把「原状」记成 90 秒，开关等于失效")
+
+if os.path.isfile(INFOPL):
+    ip = open(INFOPL, encoding="utf-8").read()
+    chk("设置页 Info.plist 的 CFBundlePackageType 为 BNDL",
+        re.search(r"<key>CFBundlePackageType</key>\s*<string>BNDL</string>", ip) is not None,
+        "" if "BNDL" in ip else "不是 BNDL 会被当独立应用启动")
+    chk("设置页 Info.plist 的 NSPrincipalClass 指向控制器",
+        "NSPrincipalClass" in ip and "NoLockWallpaperRootListController" in ip)
+    chk("设置页 Info.plist 的 CFBundleExecutable 与产物名一致",
+        re.search(r"<key>CFBundleExecutable</key>\s*<string>NoLockWallpaperPrefs</string>", ip)
+        is not None)
+
+if os.path.isfile(ENTRYPL):
+    ep = open(ENTRYPL, encoding="utf-8").read()
+    chk("入口 plist 是 PSLinkCell", "PSLinkCell" in ep)
+    chk("入口 plist 的 bundle 与 .bundle 名一致",
+        re.search(r"<key>bundle</key>\s*<string>NoLockWallpaperPrefs</string>", ep) is not None)
+    chk("入口 plist 的 detail 与 NSPrincipalClass 一致",
+        re.search(r"<key>detail</key>\s*<string>NoLockWallpaperRootListController</string>", ep)
+        is not None,
+        "" if "NoLockWallpaperRootListController" in ep else "detail 与主类名不一致 → 进不去")
+    chk("入口 plist 有 isController", "<key>isController</key>" in ep)
+    chk("入口 plist 的 icon 写基础名（不是 @2x/@3x）",
+        re.search(r"<key>icon</key>\s*<string>icon\.png</string>", ep) is not None,
+        "" if re.search(r"<key>icon</key>\s*<string>icon\.png</string>", ep)
+        else "写 icon@2x.png 会不显示图标")
+
+# 图标：入口写的是基础名 icon.png，必须三个尺寸一起打包。
+# 只给 @2x/@3x 而缺基础名 → 部分版本显示空白方块，且无任何报错。
+for _ic in ("icon.png", "icon@2x.png", "icon@3x.png"):
+    _icp = os.path.join(_REPO, "NoLockWallpaperPrefs", "Resources", _ic)
+    chk("图标存在 %s" % _ic, os.path.isfile(_icp),
+        "" if os.path.isfile(_icp) else "缺 %s → 设置里显示空白方块" % _ic)
+    if os.path.isfile(_icp):
+        _d = open(_icp, "rb").read()
+        chk("图标 %s 是合法 PNG" % _ic, _d.startswith(b"\x89PNG\r\n\x1a\n"),
+            "开头 %r" % _d[:8])
+        # 尺寸必须与文件名 scale 匹配，否则会糊或被拒
+        _base = 29
+        _exp = _base * (3 if "@3x" in _ic else (2 if "@2x" in _ic else 1))
+        try:
+            _w, _h = struct.unpack(">II", _d[16:24])
+        except Exception:
+            _w = _h = -1
+        chk("图标 %s 尺寸为 %dx%d" % (_ic, _exp, _exp), (_w, _h) == (_exp, _exp),
+            "实际 %dx%d" % (_w, _h))
+
+# =====================================================================
+print("\n[A7c] 设置页控制器源码：Preferences 七坑")
+
+PREFM = PREFM_OVERRIDE or os.path.join(_REPO, "NoLockWallpaperPrefs",
+                                       "NoLockWallpaperRootListController.m")
+chk("设置页控制器存在", os.path.isfile(PREFM))
+if os.path.isfile(PREFM):
+    pm = open(PREFM, encoding="utf-8").read()
+    pm_code = strip_code(pm)
+
+    # 坑 1：UIColorWell 会让 iOS 13 设置 App 打不开
+    chk("设置页未引用 UIColorWell（iOS 13 设置 App 会打不开）",
+        "UIColorWell" not in pm_code)
+    # 坑 4：reloadSpecifier:nil 会崩
+    chk("设置页未调用 reloadSpecifier:nil",
+        re.search(r"reloadSpecifier\s*:\s*nil", pm_code) is None)
+    # 坑 5：必须自己实现 specifiers
+    chk("设置页自己实现了 specifiers",
+        re.search(r"-\s*\(NSArray\s*\*\)\s*specifiers\s*\{", pm_code) is not None)
+    chk("设置页用 loadSpecifiersFromPlistName 载入 Root",
+        "loadSpecifiersFromPlistName" in pm_code)
+    # 坑 6：setProperty:forKey: 与 NSStream 同名异签名
+    chk("设置页未直接调用 setProperty:forKey:",
+        re.search(r"setProperty\s*:", pm_code) is None,
+        "" if re.search(r"setProperty\s*:", pm_code) is None else "会与 NSStream 同名异签名冲突")
+    # 坑 8（本轮新增，最危险）：绝不自己声明 _specifiers ivar
+    chk("设置页未自己声明 _specifiers ivar（偏移会与真实布局错位→崩设置 App）",
+        re.search(r"NSArray\s*\*\s*_specifiers\s*;", pm_code) is None,
+        "" if re.search(r"NSArray\s*\*\s*_specifiers\s*;", pm_code) is None
+        else "自己声明的 ivar 偏移与真实类不一致，运行期读错内存")
+    chk("设置页用 runtime 按名字取 _specifiers 偏移",
+        "class_getInstanceVariable" in pm_code and "ivar_getOffset" in pm_code)
+    chk("设置页对「取不到偏移」有退化处理（不缓存、不崩）",
+        re.search(r"if\s*\(!ok\)\s*return\s+nil;", pm_code) is not None,
+        "" if re.search(r"if\s*\(!ok\)\s*return\s+nil;", pm_code) else "缺退化处理")
+    chk("设置页重启桌面只杀 SpringBoard（不重启整机）",
+        "SpringBoard" in pm and "SIGTERM" in pm_code,
+        "" if ("SpringBoard" in pm and "SIGTERM" in pm_code) else "缺重启桌面实现")
+    chk("设置页未用没证据的 notify_post 通知名",
+        "notify_post" not in pm_code,
+        "" if "notify_post" not in pm_code else "通知名无实证，猜错=点了没反应")
+
+# =====================================================================
+print("\n[A7d] 禁左滑进相机：判据必须精确，不得废掉上滑解锁")
+
+# ★★ 这是本轮最容易造成「严重误伤」的地方：
+#   锁屏「左滑进相机」和「上滑解锁」都是 pan 类手势。
+#   如果图省事写成「锁屏上所有 pan 都压掉」，解锁直接废掉 ——
+#   对用户来说这比原需求（误触）严重得多，属于绝对不可接受。
+#   所以判据必须锚定「右边缘」，而不是「pan」。
+
+chk("有相机滑动判据 NLWIsCameraSwipeish", "NLWIsCameraSwipeish" in code)
+chk("有滑动类判据 NLWIsPanish", "NLWIsPanish" in code)
+chk("判据用 UIScreenEdgePanGestureRecognizer（公开类，不猜私有）",
+    "UIScreenEdgePanGestureRecognizer" in code)
+chk("判据读 edges 属性（公开 API，区分左右边缘）",
+    re.search(r"\.edges\b", code) is not None,
+    "" if re.search(r"\.edges\b", code) is not None else "不读 edges 就无法区分方向")
+chk("判据要求 UIRectEdgeRight（只针对右边缘，不碰解锁）",
+    "UIRectEdgeRight" in code,
+    "" if "UIRectEdgeRight" in code else "缺右边缘限定 = 可能废掉上滑解锁")
+chk("相机判据在压制前先过锁屏区域判据（作用域收窄）",
+    "NLWIsSuppressibleLockScreenArea" in code)
+chk("相机滑动受子开关控制（可单独关闭）",
+    # ★ 判据必须是「**每一条压制路径**都判了这个子开关」，不能是「出现过一次」。
+    #   本项目有两条路径会压制手势：
+    #     · NLWProcessView 的压制循环（主要路径）
+    #     · NLWAddGestureRecognizer 的预判（决定 add 之后要不要立刻处理）
+    #   只判一处 → 关掉子开关后，另一条路径照样压 → 用户看到「关了没用」。
+    #   反向验证 A15 实测：只查「出现过」时，删掉一处判据照样报绿。
+    len(re.findall(r"gBlockCameraSwipe\s*&&\s*NLWIsCameraSwipeish", code)) >= 2 and
+    re.search(r"static BOOL gBlockCameraSwipe\s*=", code) is not None,
+    "压制路径含子开关 %d 处（应为 2）" %
+    len(re.findall(r"gBlockCameraSwipe\s*&&\s*NLWIsCameraSwipeish", code)))
+# 反向：绝不能出现「无条件压掉所有 pan」
+chk("没有「压掉所有 pan」的粗暴写法",
+    re.search(r"NLWIsPanish\(g\)\s*\)\s*\{\s*NLWSuppressGesture", code) is None,
+    "" if re.search(r"NLWIsPanish\(g\)\s*\)\s*\{\s*NLWSuppressGesture", code) is None
+    else "会连上滑解锁一起废掉")
+chk("总开关在判据最前面（关闭时零开销放行）",
+    re.search(r"if\s*\(!gEnabled\)\s*return\s+0;", code) is not None,
+    "" if re.search(r"if\s*\(!gEnabled\)\s*return\s+0;", code) else "关闭时仍在做判据")
 
 # =====================================================================
 print("\n[A8] killswitch（出问题不用卸载）")
@@ -467,6 +716,38 @@ if m:
 print("\n[A10] 打包脚本：GNU tar 格式（PAX 会让 dpkg 装不上）")
 
 mk = open(MKDEB, encoding="utf-8").read()
+bd = open(BUILD, encoding="utf-8").read()
+
+
+def sh_code(txt):
+    """剥掉 shell 脚本里的整行注释，只留真正的代码行。
+
+    ★★★ 为什么所有 shell 判据都必须走这个函数（本项目已犯六次的同一类错误）：
+      判据一旦拿全文查，就会被「解释为什么不能用某个写法」的说明文字蒙住。
+      本轮实测的假通过：
+        · D1「载荷含 PreferenceBundles」—— 注释里写了
+          `Library/PreferenceBundles/<X>.bundle/` 的说明，删掉真正的 mkdir 后
+          判据靠注释照样报绿。
+        · A13c「未使用 __objc_exception」—— 注释里写了「不存在叫
+          __objc_exception 的段」，于是判据永远 FAIL。
+        · build.sh 里「故意不做设置页」「nlw.log」同理。
+      这一类错误的共同点不是「正则写错」，而是**判据的作用域包含了注释**。
+      所以：凡是对 .sh / .py 源码做「有没有某个字符串」的判断，
+      必须先剥注释。不要靠「我这次注释里不写这个词」来回避 ——
+      注释恰恰是最该写清楚「为什么不能这么写」的地方。
+    """
+    out = []
+    for ln in txt.splitlines():
+        s = ln.lstrip()
+        if s.startswith("#"):
+            out.append("")
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
+mk_code = sh_code(mk)
+bd_code = sh_code(bd)
 
 
 def _code_hits(txt, needle):
@@ -532,19 +813,19 @@ def _call_args(txt, start):
     return txt[start:start + 200]
 
 
-_open_pos = _code_hits(mk, "tarfile.open(")
-_calls = [_call_args(mk, p) for p, _ in _open_pos]
+_open_pos = _code_hits(mk_code, "tarfile.open(")
+_calls = [_call_args(mk_code, p) for p, _ in _open_pos]
 _no_fmt = [c for c in _calls if "format=" not in c]
 chk("mkdeb.sh 的 tarfile.open 都指定了 format",
     bool(_calls) and not _no_fmt,
     ("%d 处未指定格式: %s" % (len(_no_fmt), _no_fmt[0][:60])) if _no_fmt
     else "%d 处全部显式指定" % len(_calls))
-chk("mkdeb.sh 使用 tarfile.GNU_FORMAT", bool(_code_hits(mk, "tarfile.GNU_FORMAT")))
-chk("mkdeb.sh 代码里未显式选 PAX_FORMAT", not _code_hits(mk, "PAX_FORMAT"))
-chk("mkdeb.sh 里有 PAX 扩展头自检闸门", "_check_no_pax_headers" in mk)
+chk("mkdeb.sh 使用 tarfile.GNU_FORMAT", bool(_code_hits(mk_code, "tarfile.GNU_FORMAT")))
+chk("mkdeb.sh 代码里未显式选 PAX_FORMAT", not _code_hits(mk_code, "PAX_FORMAT"))
+chk("mkdeb.sh 里有 PAX 扩展头自检闸门", "_check_no_pax_headers" in mk_code)
 
 # 闸门必须是「按 tar 结构遍历」而非盲扫（盲扫会在二进制载荷上误报，已实测）
-m = re.search(r"def _check_no_pax_headers\(raw, label\):\n(.*?)\nimport lzma", mk, re.S)
+m = re.search(r"def _check_no_pax_headers\(raw, label\):\n(.*?)\nimport lzma", mk_code, re.S)
 if m:
     body = m.group(1)
     chk("PAX 闸门按 size 字段跳数据区（非盲扫）",
@@ -554,11 +835,96 @@ if m:
     chk("PAX 闸门读 size 字段", "int(size_f, 8)" in body)
 
 # =====================================================================
-print("\n[A11] dylib 权限必须是 755（644 会被 ellekit 拒绝）")
+print("\n[A11] 可执行位：dylib 与设置页可执行体都必须是 755")
 
 chk("mkdeb.sh 对 dylib chmod 755",
     re.search(r"chmod 755 \S*\$NAME\.dylib", mk) is not None)
-chk("_is_exec 对 .dylib 返回 True", "endswith('.dylib')" in mk)
+chk("_is_exec 对 .dylib 返回 True", "endswith('.dylib')" in mk_code)
+
+# ★ 设置页 bundle 的可执行体丢了 +x，表现是「设置页点不进去 / 白屏」，
+#   dpkg 不报错。必须单独判。
+chk("mkdeb.sh 对设置页可执行体 chmod 755",
+    re.search(r"chmod 755 \S*\$PREFBUNDLE/\$PREFNAME", mk) is not None,
+    "" if re.search(r"chmod 755 \S*\$PREFBUNDLE/\$PREFNAME", mk)
+    else "缺 chmod，设置页可执行体可能 644")
+chk("_is_exec 覆盖 PreferenceBundles 下的可执行体",
+    "Library/PreferenceBundles/" in mk_code,
+    "" if "Library/PreferenceBundles/" in mk_code else "打包脚本不认设置页可执行位")
+chk("_is_exec 用 len('.bundle') 而不是写死切片下标",
+    "len('.bundle')" in mk_code,
+    "" if "len('.bundle')" in mk_code else "写死下标错一位就静默失败")
+
+# =====================================================================
+print("\n[A11b] 设置页载荷：两个入口缺一不可")
+
+# ★★ 判据必须精确到「真的有 mkdir/cp 这两个路径」，而不是「文本里出现过
+#   这个路径字符串」。反向验证 D1/D2 实测：只查字符串时，把真正的 mkdir
+#   删掉、判据靠注释里的路径说明照样报绿 —— 假通过。
+#   正确做法：在剥掉注释的代码里，找实际命令行的出现。
+def _has_cmd_line(code_txt, needle):
+    """在剥注释后的 shell 代码里，找「非注释行中包含 needle」的行。
+
+    与 _code_hits 的区别：这里不需要引号状态机（shell 判据多看命令行形态），
+    但必须确认 needle 出现在**会被执行的**那一行里，
+    且不是出现在 echo/printf 的提示文案中。
+    """
+    for ln in code_txt.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        if needle not in s:
+            continue
+        # 排除「只是打印给用户看的文案」
+        if s.startswith("echo ") or s.startswith("printf "):
+            continue
+        return True
+    return False
+
+
+chk("mkdeb.sh 真的把设置页可执行文件拷进 PreferenceBundles",
+    _has_cmd_line(mk_code, '.build/$PREFNAME.bundle/$PREFNAME'),
+    "" if _has_cmd_line(mk_code, '.build/$PREFNAME.bundle/$PREFNAME')
+    else "bundle 里没有可执行文件 → 设置页白屏")
+chk("mkdeb.sh 真的写了 PreferenceLoader 入口 plist",
+    _has_cmd_line(mk_code, "$PREFENTRY/Root.plist"),
+    "" if _has_cmd_line(mk_code, "$PREFENTRY/Root.plist")
+    else "缺入口 plist → 设置里根本不显示本插件")
+# ★ 为什么判据锚定「cp / 写文件」而不是「mkdir -p」：
+#   mkdir 失败会让后续 cp 立即报错，属于「构建就挂」，不是静默缺陷；
+#   而 cp 那一步被删掉时脚本照样跑完、deb 照样生成，
+#   装上去才发现「设置里没有这一项」—— 那才是真正需要拦的。
+chk("PREFBUNDLE 指向 PreferenceBundles",
+    re.search(r"PREFBUNDLE=\"\$STAGE/Library/PreferenceBundles/\$PREFNAME\.bundle\"",
+              mk_code) is not None,
+    "" if re.search(r"PREFBUNDLE=", mk_code) else "缺 PREFBUNDLE 定义")
+chk("PREFENTRY 指向 PreferenceLoader/Preferences",
+    re.search(r"PREFENTRY=\"\$STAGE/Library/PreferenceLoader/Preferences/\$PREFNAME\"",
+              mk_code) is not None,
+    "" if re.search(r"PREFENTRY=", mk_code) else "缺 PREFENTRY 定义")
+chk("入口 plist 转二进制（PLIST 格式）",
+    _has_cmd_line(mk_code, "FMT_BINARY"),
+    "" if _has_cmd_line(mk_code, "FMT_BINARY") else "XML 文本在部分版本不被 PreferenceLoader 认")
+
+# ★ 图标三个尺寸都要打包：入口 plist 写的是基础名 icon.png，
+#   iOS 按 scale 找 @2x/@3x。缺基础名时部分版本显示空白方块，且无报错。
+chk("mkdeb.sh 三个尺寸图标一起打包（含基础名 icon.png）",
+    _has_cmd_line(mk_code, "for _ic in icon.png icon@2x.png icon@3x.png"),
+    "" if _has_cmd_line(mk_code, "for _ic in icon.png icon@2x.png icon@3x.png")
+    else "缺基础名 → 部分版本设置页图标空白")
+chk("control 依赖 preferenceloader",
+    _has_cmd_line(mk_code, "preferenceloader"),
+    "" if _has_cmd_line(mk_code, "preferenceloader") else "纯净设备上装完设置里看不到，dpkg 不报错")
+chk("已移除「故意不做设置页」的旧注释",
+    "故意不做设置页" not in mk_code)
+chk("postinst 不再提日志路径",
+    "nlw.log" not in mk_code,
+    "" if "nlw.log" not in mk_code else "日志已删，postinst 还在指路")
+# ★ postinst 的文案本身写在 printf 里（heredoc 内容），
+#   所以这一条不能用 _has_cmd_line（它会跳过 printf 行）。
+#   判据改为「heredoc 正文里出现过」，且必须出现 —— 装完用户需要知道去哪开关。
+chk("postinst 提示了设置页位置",
+    "设置 → NoLockWallpaper" in mk_code,
+    "" if "设置 → NoLockWallpaper" in mk_code else "装完用户不知道去哪开/关")
 
 # =====================================================================
 print("\n[A12] 注入范围限定 SpringBoard")
@@ -572,12 +938,12 @@ chk("没有把 Filter 写成空（会注入所有进程）",
 print("\n[A13] 构建不安装 Theos（用户明确要求）")
 
 bd = open(BUILD, encoding="utf-8").read()
-chk("build.sh 未调用 install-theos", "install-theos" not in bd)
-chk("build.sh 用 xcrun clang 直接编", "xcrun clang" in bd)
-chk("build.sh 走 mkdeb.sh 打包", "mkdeb.sh" in bd)
+chk("build.sh 未调用 install-theos", "install-theos" not in bd_code)
+chk("build.sh 用 xcrun clang 直接编", "xcrun clang" in bd_code)
+chk("build.sh 走 mkdeb.sh 打包", "mkdeb.sh" in bd_code)
 chk("build.sh 覆盖 arm64e 与 arm64",
-    "arm64e" in bd and "arm64)" in bd)
-chk("build.sh 校验架构切片", "lipo -info" in bd)
+    "arm64e" in bd_code and "arm64)" in bd_code)
+chk("build.sh 校验架构切片", "lipo -info" in bd_code)
 
 # =====================================================================
 print("\n[A13b] 功能指纹闸门：属性名 vs 选择子名（真实误报过一次）")
@@ -597,12 +963,19 @@ chk("代码确实在赋 minimumPressDuration（闸门的前提成立）",
 #   为什么：注释里也会提到 setMinimumPressDuration（就是上面那段说明），
 #   全文搜会被自己的注释蒙过去 —— 反向验证 B1 实测漏放，正是这个原因。
 #   「把说明文字当成代码」这个坑本项目已经犯过四次，这里必须精确到结构。
+#
+# ★★ 1.1 起 build.sh 里有**四个** for sym 循环（主指纹 / 相机指纹 /
+#    开关指纹 / 设置页指纹）。只解析第一个会让后三个的判据全部失效 ——
+#    那是「闸门自己漏检」，比没有闸门更危险（因为它报绿）。
+#    所以这里解析**全部**循环，合并成一个集合。
 _fp_block = []
-_m = re.search(r"for sym in (.*?);\s*do", bd, re.S)
-if _m:
-    _fp_block = _m.group(1).split()
+for _m in re.finditer(r"for sym in (.*?);\s*do", bd_code, re.S):
+    _fp_block.extend(_m.group(1).split())
 chk("能解析出指纹列表 for sym", bool(_fp_block),
-    "解析到 %d 项" % len(_fp_block) if _fp_block else "解析失败，判据无效")
+    "解析到 %d 项（含全部 for 循环）" % len(_fp_block) if _fp_block else "解析失败，判据无效")
+chk("build.sh 至少有 2 个 for sym 循环（主 + 设置页）",
+    len(re.findall(r"for sym in (.*?);\s*do", bd_code, re.S)) >= 2,
+    "实际 %d 个" % len(re.findall(r"for sym in (.*?);\s*do", bd_code, re.S)))
 
 chk("指纹列表含 setMinimumPressDuration（setter 名）",
     "setMinimumPressDuration" in _fp_block,
@@ -618,6 +991,50 @@ chk("指纹列表覆盖三个 hook 选择子",
 chk("指纹列表覆盖锁屏类名判据关键串",
     "LockScreen" in _fp_block and "CoverSheet" in _fp_block,
     "实际：%s" % _fp_block)
+
+# ★ 1.1 新增功能的指纹：任何一条漏了，产物表面看不出来，装上就是功能缺失。
+chk("指纹列表覆盖 edge pan 判据",
+    "UIScreenEdgePanGestureRecognizer" in _fp_block and "edges" in _fp_block,
+    "实际：%s" % _fp_block,
+    )
+chk("指纹列表覆盖配置域名与两个开关键",
+    all(x in _fp_block for x in
+        ["com.liehuu.nolockwallpaper", "Enabled", "BlockCameraSwipe"]),
+    "实际：%s" % _fp_block)
+
+# 设置页产物必须单独过指纹闸门（主 dylib 的闸门管不到它）
+chk("build.sh 有设置页产物的指纹闸门",
+    re.search(r"PREF_OUT/\$PREFNAME\b", bd) is not None or
+    "PREF_OUT" in bd_code,
+    "" if "PREF_OUT" in bd_code else "设置页白屏不会被发现")
+chk("设置页产物也过架构闸门",
+    re.search(r'lipo -info\s+"\$PREF_OUT', bd_code) is not None,
+    "" if re.search(r'lipo -info\s+"\$PREF_OUT', bd_code) is not None
+    else "设置页架构不对不会被发现（主 dylib 的闸门查不到它）")
+
+# =====================================================================
+print("\n[A13c] 异常处理段名必须是真的（__objc_exception 不存在）")
+
+# ★ 真实踩过的坑：第一版闸门查 otool 里的 '__objc_exception'，
+#   这个段**不存在**（ObjC 的 @try 落点是 __TEXT 段里的 __gcc_except_tab）。
+#   于是那条闸门永远走 else 分支只打印「提示」，从来没真正拦过任何东西 ——
+#   典型的「闸门自己坏掉还一直报绿」。
+#
+# ★★ 判据必须排除注释。本项第一版写成 `"__objc_exception" not in bd`，
+#   结果被 build.sh 里那句「**不存在**叫 __objc_exception 的段」的说明
+#   命中了 —— 又是「把解释文字当成代码」，本项目已犯过五次。
+#   正解：剥掉整行注释后再查。
+_bd_code = "\n".join(
+    ("" if ln.lstrip().startswith("#") else ln) for ln in bd.splitlines())
+chk("build.sh 代码里未使用不存在的段名 __objc_exception",
+    "__objc_exception" not in _bd_code,
+    "" if "__objc_exception" not in _bd_code else "该段不存在，判据永远不生效")
+chk("build.sh 用 __gcc_except_tab 判 @try 生效", "__gcc_except_tab" in _bd_code,
+    "" if "__gcc_except_tab" in _bd_code else "缺真实的 LSDA 段判据")
+chk("build.sh 缺 __gcc_except_tab 时是硬失败（不是提示）",
+    re.search(r"__gcc_except_tab.*?exit 1", _bd_code, re.S) is not None,
+    "" if re.search(r"__gcc_except_tab.*?exit 1", _bd_code, re.S) is not None
+    else "只打印提示 = 等于没拦")
 
 # =====================================================================
 print("\n[A14] shell 里 $VAR 不得紧跟全角字符（bash 会算进变量名）")

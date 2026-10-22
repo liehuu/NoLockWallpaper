@@ -17,44 +17,83 @@ STAGE="$ROOT/.build/stage"
 OUT="$ROOT/.build/out"
 PKG="com.liehuu.nolockwallpaper"
 NAME="NoLockWallpaper"
+# ★ 设置页的基础名单独给个变量，不要用 "$NAME"Prefs 这种拼接：
+#   在 shell 里相邻的字符串会被拼一起，读起来极容易看错（以为少了引号），
+#   后面改路径时也容易改漏。
+PREFNAME="NoLockWallpaperPrefs"
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/DEBIAN" \
          "$STAGE/Library/MobileSubstrate/DynamicLibraries" \
+         "$STAGE/Library/PreferenceBundles/$PREFNAME.bundle" \
+         "$STAGE/Library/PreferenceLoader/Preferences/$PREFNAME" \
          "$OUT"
 
-# ---- 载荷 ----
+# ---- 载荷：主 tweak ----
 cp "$ROOT/.build/$NAME.dylib" \
    "$STAGE/Library/MobileSubstrate/DynamicLibraries/$NAME.dylib"
 cp "$ROOT/$NAME.plist" \
    "$STAGE/Library/MobileSubstrate/DynamicLibraries/$NAME.plist"
 
-# ★ 故意不做设置页入口：
-#   设置页需要额外维护一整套 Preferences bundle（本项目踩过 7 个坑：
-#   UIColorWell 类符号会让 iOS13 设置 App 打不开、_specifiers ivar 必须自己声明、
-#   setProperty:forKey: 与 NSStream 同名异签名……）。
-#   本插件功能单一、没有可配置项，加设置页只是白扩崩溃面。
-#   开关需求用 killswitch 文件满足（见 postinst 提示）。
+# ---- 载荷：设置页 bundle ----
+# ★ 设置页需要**两个入口**，缺一个就进不去：
+#   ① Library/PreferenceBundles/<X>.bundle/   ← 控制器 + 资源
+#   ② Library/PreferenceLoader/Preferences/<X>/Root.plist ← 设置列表里的那一项
+#   只放 ① 不会出现在设置里；只放 ② 点进去会白屏（找不到 bundle）。
+PREFSRC="$ROOT/$PREFNAME"
+PREFBUNDLE="$STAGE/Library/PreferenceBundles/$PREFNAME.bundle"
+PREFENTRY="$STAGE/Library/PreferenceLoader/Preferences/$PREFNAME"
+
+cp "$ROOT/.build/$PREFNAME.bundle/$PREFNAME" "$PREFBUNDLE/"
+cp "$PREFSRC/Resources/Info.plist"           "$PREFBUNDLE/"
+cp "$PREFSRC/Resources/Root.plist"           "$PREFBUNDLE/"
+# ★ 三个尺寸都要拷：入口 plist 里写的是基础名 `icon.png`，
+#   iOS 会按屏幕 scale 去找 icon@2x/@3x；只给 @2x/@3x 而缺基础名，
+#   在部分版本（以及设置页缩略图缓存命中时）会显示成空白方块。
+for _ic in icon.png icon@2x.png icon@3x.png; do
+  if [ -f "$PREFSRC/Resources/$_ic" ]; then
+    cp "$PREFSRC/Resources/$_ic" "$PREFBUNDLE/"
+  fi
+done
+
+# 入口 plist 必须是**二进制** plist：
+# PreferenceLoader 实际读的是二进制格式，XML 文本在部分版本上不认。
+# 用 python 转一下（构建机一定有 python3，本脚本后面本来就要用它）。
+python3 - "$PREFSRC/layout/Library/PreferenceLoader/Preferences/$PREFNAME/Root.plist" \
+          "$PREFENTRY/Root.plist" <<'PYPLIST'
+import plistlib, sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, 'rb') as f:
+    obj = plistlib.load(f)
+with open(dst, 'wb') as f:
+    plistlib.dump(obj, f, fmt=plistlib.FMT_BINARY)
+print('  ✓ 入口 plist 已转为二进制格式')
+PYPLIST
 
 # 权限：目录 755，文件 644
 # ★ dylib 必须 755：644 会被 ellekit / RootHide 的加载器拒绝，
 #   表现是「装了完全没反应」，dpkg 却不报任何错。
+# ★ 设置页的可执行文件同理必须 755。
 find "$STAGE" -type d -exec chmod 755 {} \;
 find "$STAGE" -type f -exec chmod 644 {} \;
 chmod 755 "$STAGE/Library/MobileSubstrate/DynamicLibraries/$NAME.dylib"
+chmod 755 "$PREFBUNDLE/$PREFNAME"
 
 # ---- control ----
 # 版本号必须由参数派生，不能硬编码（SingleVPN v2.8 踩过：包名 v2.7、内容 v2.8）
+# ★ Depends 加 preferenceloader：设置页入口靠它加载。
+#   不带这个依赖的话，纯净设备上装完「设置里看不到」，
+#   而 dpkg 不会提示任何问题 —— 排查成本极高。
 cat > "$STAGE/DEBIAN/control" <<EOF
 Package: $PKG
 Name: NoLockWallpaper
 Version: $VER
 Architecture: $ARCH
-Description: 禁用锁屏长按换壁纸（防止误触）
+Description: 锁屏防误触：禁长按换壁纸、禁左滑进相机
 Maintainer: liehuu
 Author: liehuu
 Section: Tweaks
-Depends: mobilesubstrate
+Depends: mobilesubstrate, preferenceloader
 EOF
 chmod 644 "$STAGE/DEBIAN/control"
 
@@ -66,9 +105,12 @@ cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 set -e
 printf '\n'
 printf 'NoLockWallpaper 已安装。\n'
-printf '生效方式：重启桌面（respring）或直接锁屏一次再解锁。\n'
-printf '日志：/var/mobile/Library/Logs/NoLockWallpaper/nlw.log\n'
-printf '临时停用：创建空文件 /var/mobile/Library/Preferences/com.liehuu.nlw.disabled 再 respring\n'
+printf '生效方式：重启桌面（respring），或直接锁屏一次再解锁。\n'
+printf '开关位置：设置 → NoLockWallpaper\n'
+printf '\n'
+printf '应急停用（设置打不开时）：创建空文件\n'
+printf '  /var/mobile/Library/Preferences/com.liehuu.nlw.disabled\n'
+printf '再重启桌面，插件将完全不再动手。删掉该文件即恢复。\n'
 printf '\n'
 if [ -x /usr/bin/sbreload ]; then /usr/bin/sbreload >/dev/null 2>&1 || true; fi
 exit 0
@@ -94,12 +136,30 @@ def _is_exec(rel):
 
     SpringBoard 注入的 dylib 如果丢了 +x，装上去表现是「插件完全没加载」，
     而 dpkg 不报任何错 —— 这类问题排查成本极高，必须精确。
+
+    ★ 设置页 bundle 里的可执行文件同理：丢了 +x 就是「设置页白屏 / 点不进去」，
+      而且完全没有报错。它的路径特征是
+      Library/PreferenceBundles/<名>.bundle/<名>
+      —— 目录里那个「没有扩展名的文件」才是 Mach-O 可执行体，
+      同目录下的 Info.plist / Root.plist / icon@2x.png 都不能给 +x。
     """
     if rel.endswith('.dylib'):
         return True
     if rel.startswith('DEBIAN/') and rel.split('/')[-1] in \
             ('postinst', 'postrm', 'preinst', 'prerm'):
         return True
+    # ---- 设置页 bundle 的可执行体 ----
+    if rel.startswith('Library/PreferenceBundles/'):
+        parts = rel.split('/')
+        # 形如 Library/PreferenceBundles/X.bundle/X → 4 段，最后一段无扩展名
+        if len(parts) == 4 and parts[-1] and '.' not in parts[-1]:
+            bundle = parts[2]
+            # ★ 不要把 '.bundle' 的长度写死成切片下标（[:-7]）：
+            #   一旦哪天写成 [:-8] 就静默错一位，导致可执行文件拿不到 +x，
+            #   而这里出错的表现是「设置页点不进去」，极难反查。
+            if bundle.endswith('.bundle'):
+                if bundle[:len(bundle) - len('.bundle')] == parts[3]:
+                    return True
     return False
 
 
