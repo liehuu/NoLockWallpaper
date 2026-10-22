@@ -883,6 +883,29 @@ chk("_is_exec 用 len('.bundle') 而不是写死切片下标",
     "len('.bundle')" in mk_code,
     "" if "len('.bundle')" in mk_code else "写死下标错一位就静默失败")
 
+# ★★ data.tar 必须排除 DEBIAN/（2026-10-22 发现的真实缺陷）
+#   dpkg 只从 control.tar.gz 读控制文件。data.tar 里若也带 ./DEBIAN/postinst，
+#   会被解到文件系统根目录的 /DEBIAN/postinst：
+#     · rootful → 根目录留垃圾，卸载不清
+#     · rootless → / 只读，解包直接失败，整个 deb 装不上
+#   这个缺陷 1.0-1 / 1.1-1 / 1.2-1（首版）一直存在，装了 3 个版本才被发现。
+#   ★ 判据要盯「_tar() 遍历时是否真的剪掉了」，不是「注释里有没有写 DEBIAN」。
+chk("mkdeb.sh 的 _tar() 遍历时剪掉 DEBIAN/",
+    re.search(r"rel_root\s*==\s*'DEBIAN'", mk_code) is not None
+    and re.search(r"dirs\[:\]\s*=", mk_code) is not None,
+    "" if re.search(r"rel_root\s*==\s*'DEBIAN'", mk_code) is not None
+    else "data.tar 会带上 ./DEBIAN/postinst（rootless 上 / 只读 → 装不上）")
+chk("剪枝后确实 continue 跳过该子树",
+    re.search(r"startswith\('DEBIAN/'\)[\s\S]{0,120}?continue", mk_code) is not None,
+    "" if re.search(r"startswith\('DEBIAN/'\)[\s\S]{0,120}?continue", mk_code)
+    else "只判了条件没跳过 → 剪枝无效")
+chk("check_deb.py 校验 data.tar 不含 DEBIAN/",
+    "不含 DEBIAN/" in open(CHECKDEB, encoding="utf-8").read()
+    if os.path.isfile(CHECKDEB) else False,
+    "" if os.path.isfile(CHECKDEB) and
+    "不含 DEBIAN/" in open(CHECKDEB, encoding="utf-8").read()
+    else "产物侧无此判据 → 打包脚本被改回来时无人发现")
+
 # =====================================================================
 print("\n[A11b] 设置页载荷：两个入口缺一不可")
 
