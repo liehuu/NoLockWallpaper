@@ -599,280 +599,19 @@ static BOOL NLWIsCameraEntryGestureClass(const char *n)
     return NO;
 }
 
-/// 是否「值得记录启用时机」的候选类。
-///
-/// ★ 与上面的硬判定分开：这些只记录、不拦截。
-///   `_UIPendingEdgeSwipe` / `UIImmediateEdgeSwipe` 是 UIKit 的
-///   **边缘手势仲裁器**（target 是 __UISystemGestureManager），
-///   不是相机本身。拦它们会破坏仲裁，可能导致别的边缘手势失灵 ——
-///   所以这一版只观察它们的启用时机，用日志确认它们到底负不负责相机。
-static BOOL NLWIsCameraEntryCandidateClass(const char *n)
-{
-    if (!n) return NO;
-    if (NLWIsCameraEntryGestureClass(n)) return YES;
-    if (strstr(n, "EdgeSwipe")) return YES;      // Pending / Immediate 两种
-    if (strstr(n, "Grabber")) return YES;        // 各类把手
-    return NO;
-}
+// ★ 正式版（2.1-1）删掉了「候选类」这个函数：
+//   它只用于诊断版的「记录启用时机、不拦截」分支，诊断代码整块移除后
+//   就没有调用点了，留着只会产生 -Wunused-function 警告。
+//   ★ 它记录的那条结论已经沉淀在文档里，不需要代码：
+//     `_UIPendingEdgeSwipe` / `UIImmediateEdgeSwipe` 是 UIKit 的边缘手势
+//     仲裁器（target 是 __UISystemGestureManager），**不是相机本身**，
+//     拦它们会破坏仲裁、让别的边缘手势失灵 —— 所以正式版对它们一律不碰。
 
-// ============================================================================
-//  四点五、临时诊断（1.3-1 起；定位完必须整块删除）
-// ============================================================================
 
-//
-// ★ 前向声明（CI 真实失败过，2026-10-22）：
-//   本段插在文件靠前的位置，但它要用的是**后面才定义**的
-//   NLWIsSuppressibleLockScreenArea（在「六、压制主逻辑」里）。
-//   C 不允许隐式声明函数，漏了这两行就是：
+// ★ 前向声明：本段位置靠前，但要用的 NLWIsSuppressibleLockScreenArea
+//   在「六、压制主逻辑」里才定义。C 不允许隐式声明函数，缺了这行就是 CI 上那句
 //     error: call to undeclared function 'NLWIsSuppressibleLockScreenArea'
-//     error: static declaration of ... follows non-static declaration
-//   ★ 通用规律：**新插入的代码块如果位置靠前，必须逐一核对它用到的
-//     每个函数是否已在前面定义或声明过**。本机无 Xcode，编译器不拦就
-//     只能等 CI —— 这类错误纯靠通读代码就能避免。
 static BOOL NLWIsSuppressibleLockScreenArea(UIView *v);
-//
-// ★ 为什么要破例在热路径写文件：
-//   实机反馈「禁长按换壁纸生效，禁左滑进相机没生效」。
-//   长按能拦 ⇒ dylib 已加载、hook 已装上，问题在**判据没命中**。
-//   而判据为什么没命中，只有四种可能，仅凭描述无法区分：
-//     ① 相机手势根本不是 UIScreenEdgePanGestureRecognizer
-//     ② 是 edge pan，但 edges 不是 UIRectEdgeRight（可能是 Left / Both）
-//     ③ 宿主视图不在「锁屏可压制区域」内（被滚动容器或 UIControl 判据挡住）
-//     ④ hook 装得比手势添加晚（addGestureRecognizer 完全没拦到）
-//   靠猜改判据 = 反复返工，用户已经为这个问题多装过一次包了。
-//   本版只记录、不改任何判据，装一次就能把四个可能性一次排除。
-//
-// ★ 为什么不能直接把判据放宽成「压掉锁屏上所有 edge pan」：
-//   iOS 锁屏「右上角下滑呼出控制中心」也是边缘手势。放宽就等于
-//   顺带废掉控制中心 —— 那是比原问题更严重的误伤。
-//   所以必须先用真实 edges 值区分，再决定放宽到哪一档。
-//
-// ★ 风险控制（这段跑在 SpringBoard 热路径里，必须苛刻）：
-//   · 只记录滑动类手势（锁屏上数量是个位数），点击/长按一律早退
-//   · 同一手势指针只记一次（去重），上限 200 条，达上限立即停止
-//   · 只在后台队列写，2 秒 debounce，最多写 20 次
-//   · 全程 @try 包裹，任何异常都不外泄到调用方线程
-//   · 写两个位置（移动端 Logs 目录 + /tmp），任一能读到即可
-
-static NSMutableArray *gDiagLines   = nil;
-static NSMutableArray *gDiagSeen    = nil;   // NSValue 包手势指针，去重
-static NSObject       *gDiagLock    = nil;
-static BOOL            gDiagScheduled = NO;
-static int             gDiagFlushes   = 0;
-
-static void NLWDiagFlushNow(void)
-{
-    @autoreleasepool {
-        NSArray *snapshot = nil;
-        @synchronized (gDiagLock) {
-            gDiagScheduled = NO;
-            if (gDiagLines.count == 0) return;
-            snapshot = [gDiagLines copy];
-        }
-        @try {
-            NSString *body = [snapshot componentsJoinedByString:@"\n"];
-            NSFileManager *fm = [NSFileManager defaultManager];
-
-            // 位置一：常规日志目录（1.0-1 时代验证过 SpringBoard 可写这里）
-            NSString *dir = @"/var/mobile/Library/Logs/NoLockWallpaper";
-            [fm createDirectoryAtPath:dir withIntermediateDirectories:YES
-                            attributes:nil error:NULL];
-            [body writeToFile:[dir stringByAppendingPathComponent:@"diag.txt"]
-                   atomically:YES encoding:NSUTF8StringEncoding error:NULL];
-
-            // 位置二：/tmp —— RootHide 可能重定向 /var/mobile/Library 下
-            //         的某些目录，写两份保证至少有一份能读到
-            [body writeToFile:@"/tmp/nlw_diag.txt"
-                   atomically:YES encoding:NSUTF8StringEncoding error:NULL];
-        } @catch (NSException *e) { }
-    }
-}
-
-/// 追加一行诊断。线程安全 + 自动 debounce 落盘。
-static void NLWDiagAdd(NSString *line)
-{
-    @try {
-        if (!gDiagLock) {
-            @synchronized (NSFileManager.class) {   // 一次性初始化用，借用任意类对象做锁
-                if (!gDiagLock) {
-                    gDiagLines = [NSMutableArray new];
-                    gDiagSeen  = [NSMutableArray new];
-                    gDiagLock  = [NSObject new];
-                }
-            }
-        }
-        BOOL needSchedule = NO;
-        @synchronized (gDiagLock) {
-            if (gDiagLines.count >= 200) return;
-            [gDiagLines addObject:(line ?: @"?")];
-            if (!gDiagScheduled && gDiagFlushes < 20) {
-                gDiagScheduled = YES;
-                gDiagFlushes++;
-                needSchedule = YES;
-            }
-        }
-        if (needSchedule) {
-            // ★ 绝不在当前线程写盘：调用方是 SpringBoard 主线程，
-            //   主线程上做文件 IO 是 watchdog 杀进程的经典成因。
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
-                           dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
-                NLWDiagFlushNow();
-            });
-        }
-    } @catch (NSException *e) { }
-}
-
-/// 记录一次 `setEnabled:` 调用（1.6-1 新增）。
-///
-/// ★ 为什么要单独记这个：
-///   前三版一直看不见相机手势，是因为它「默认关闭」——
-///   只有系统在特定时机 `setEnabled:YES` 时它才会出现在视野里。
-///   把「谁被启用了」记下来，等于直接读到系统的心跳。
-///
-/// ★ 为什么按类名限流 8 次：
-///   enable 调用比 add 频繁得多（同一个手势可能被反复开关）。
-///   不限流会在几秒内刷满 200 行的上限，把真正有价值的手势记录挤掉。
-///
-/// ★ 位置说明：本函数必须定义在 NLWDiagAdd **之后** ——
-///   C 不允许隐式声明，反过来写就是 CI 上那句
-///   `call to undeclared function 'NLWDiagAdd'`。
-static NSMutableDictionary *gDiagEnableCount = nil;
-
-static void NLWDiagNoteEnable(const char *clsName, BOOL blocked)
-{
-    @try {
-        NSString *k = (clsName ? [NSString stringWithUTF8String:clsName] : nil);
-        if (!k) return;
-
-        NSUInteger times = 0;
-        @synchronized ([NSFileManager class]) {
-            if (!gDiagEnableCount) gDiagEnableCount = [NSMutableDictionary new];
-            NSNumber *c = gDiagEnableCount[k];
-            times = (c ? c.unsignedIntegerValue : 0) + 1;
-            if (times > 8) return;
-            gDiagEnableCount[k] = @(times);
-        }
-
-        NSString *line = [NSString stringWithFormat:
-            @"[enable#%lu] cls=%@ blocked=%d gEn=%d camSw=%d",
-            (unsigned long)times, k, (int)blocked,
-            (int)gEnabled, (int)gBlockCameraSwipe];
-        NLWDiagAdd(line);
-    } @catch (NSException *e) { }
-}
-
-/// 记录一个手势的完整现场。tag 用于区分是在哪一层捕获到的
-/// （add = 添加时拦到；scan = 上屏/出现时补扫到）。
-static void NLWDiagNoteGesture(UIGestureRecognizer *g, UIView *host, const char *tag)
-{
-    if (!g) return;
-    @try {
-        BOOL isEdge = [g isKindOfClass:[UIScreenEdgePanGestureRecognizer class]];
-        BOOL isPan  = NLWIsPanish(g);
-
-        // ★★ 1.5-1：诊断范围从「滑动类」放宽到
-        //   「滑动类 + 系统手势窗口/锁屏区域上的**任何**手势」。
-        //
-        //   为什么必须放宽（1.4-1 日志给出的硬证据，2026-10-22）：
-        //   108 条记录、13 个手势类，**全部是 Pan 类**，
-        //   而 `camera` 字样一个都没有 —— 可用户确实能通过
-        //   「锁屏右边缘左滑」进相机。
-        //   两者同时成立，只剩一个解释：**那个手势不是 pan 类**，
-        //   被下面这条早退直接丢掉了，从 add 层到判据层连续两道都没看见它。
-        //   所以本轮正是要查「非 pan 类里有没有相机手势」。
-        BOOL sysHost = NLWIsSystemGestureHost(host);
-        BOOL sup     = NLWIsSuppressibleLockScreenArea(host);
-        if (!isEdge && !isPan && !sysHost && !sup) return;
-
-        // 懒初始化（借任意类对象做一次性初始化锁，避免另起 pthread_once）
-        @synchronized ([NSFileManager class]) {
-            if (!gDiagLock) {
-                gDiagLines = [NSMutableArray new];
-                gDiagSeen  = [NSMutableArray new];
-                gDiagLock  = [NSObject new];
-            }
-        }
-
-        // 去重：同一个手势实例只记一次（scan 层会反复扫到同一批手势）
-        @synchronized (gDiagLock) {
-            NSValue *k = [NSValue valueWithPointer:(__bridge void *)g];
-            if ([gDiagSeen containsObject:k]) return;
-            if (gDiagSeen.count >= 400) return;
-            [gDiagSeen addObject:k];
-        }
-
-        const char *cn = class_getName(object_getClass(g));
-
-        NSString *edges = @"-";
-        if (isEdge) {
-            @try {
-                edges = [NSString stringWithFormat:@"%lu",
-                         (unsigned long)((UIScreenEdgePanGestureRecognizer *)g).edges];
-            } @catch (NSException *e) { }
-        }
-
-        // ★ 1.5-1 新增：swipe 的方向值。
-        //   UISwipeGestureRecognizer 没有 edges 属性，方向只在 direction 里。
-        //   1=右 2=左 4=上 8=下（可以相加）。
-        NSString *dir = @"-";
-        @try {
-            if ([g isKindOfClass:[UISwipeGestureRecognizer class]]) {
-                dir = [NSString stringWithFormat:@"%lu",
-                       (unsigned long)((UISwipeGestureRecognizer *)g).direction];
-            }
-        } @catch (NSException *e) { }
-
-        // 宿主类名链（最多 10 层，够看出是不是锁屏 / 相机容器）
-        NSMutableArray *chain = [NSMutableArray array];
-        @try {
-            UIView *v = host;
-            int d = 0;
-            while (v && d++ < 10) {
-                NSString *n = NSStringFromClass([v class]);
-                [chain addObject:(n ? n : @"?")];
-                v = [v superview];
-            }
-        } @catch (NSException *e) { }
-
-        NSString *tagStr = (tag ? [NSString stringWithUTF8String:tag] : @"?");
-        // ★ 这里**故意不复算**相机判据。
-        //   一是避免多一处判据引用（源码闸门要求「两处主逻辑用同一判据」，
-        //   多一处会让计数失真）；二是没必要 —— 判据是否命中完全可以从
-        //   这里记录的原始事实（类名 / edges / sup）推出来，而原始事实
-        //   才是真正要拿到的数据。
-        // ★ 1.4-1 新增：把手势自己的 description 也记下来。
-        //   这是本轮唯一能回答「这个手势到底是谁的」的数据源 ——
-        //   它内部带 target 的 action 名与 target 类名。
-        //
-        // ★ 1.5-1 修正：**去掉「只对 pan 类记」的限制**。
-        //   上一版就是因为这个限制，让「本来就是非 pan 类的相机手势」
-        //   连 desc 都没有，等于对最可疑的那一类完全失明。
-        //   现在凡是能走到这里的（含 sysHost/锁屏上的任意手势）都记。
-        NSString *desc = @"-";
-        @try {
-            NSString *d = [g description];
-            if ([d isKindOfClass:[NSString class]] && d.length) {
-                if (d.length > 480) d = [d substringToIndex:480];
-                // 压成一行，避免破坏「一行一条记录」的解析
-                desc = [d stringByReplacingOccurrencesOfString:@"\n"
-                                                    withString:@" "];
-            }
-        } @catch (NSException *e) { }
-
-        NSString *line = [NSString stringWithFormat:
-            @"[%@] cls=%s edge=%d edges=%@ dir=%@ sup=%d sysHost=%d\n"
-            @"     gEn=%d camSw=%d\n"
-            @"     desc=%@\n"
-            @"     chain=%@",
-            (tagStr ? tagStr : @"?"),
-            (cn ? cn : "?"), (int)isEdge, edges, (dir ? dir : @"-"),
-            (int)sup, (int)sysHost,
-            (int)gEnabled, (int)gBlockCameraSwipe,
-            (desc ? desc : @"-"),
-            [chain componentsJoinedByString:@" > "]];
-        NLWDiagAdd(line);
-    } @catch (NSException *e) { }
-}
 
 // ============================================================================
 //  五、压制动作（含「记住原状」以支持实时恢复）
@@ -1059,12 +798,6 @@ static NSUInteger NLWProcessView(UIView *v)
 
         for (UIGestureRecognizer *g in gs) {
             @try {
-                // ★ 诊断（1.3-1 临时）：这一层是「视图已上屏、补扫它身上
-                //   早已挂好的手势」。如果相机手势是在 hook 装上之前就添加的，
-                //   只有这里能拿到它 —— 所以必须在这里也记一笔，
-                //   否则「add 层没记录」这个现象会被误判成「hook 没装上」。
-                NLWDiagNoteGesture(g, v, "scan");
-
                 if (NLWIsLongPressish(g)) {
                     // ★ 长按类仍然严格限定在「锁屏可压制区」。
                     //   放宽到系统手势窗口会把主屏图标长按、通知长按一起带走。
@@ -1282,8 +1015,6 @@ static NLWMSHookFn NLWGetMSHook(void)
     gNLWMSHookDone = YES;
     @try {
         gNLWMSHook = (NLWMSHookFn)dlsym(RTLD_DEFAULT, "MSHookMessageEx");
-        NLWDiagAdd([NSString stringWithFormat:
-            @"[ms] MSHookMessageEx=%p", (void *)gNLWMSHook]);
     } @catch (NSException *e) { }
     return gNLWMSHook;
 }
@@ -1316,25 +1047,18 @@ static BOOL NLWInstallBoolGetterHook(Class cls, SEL sel, IMP newImp,
                                     IMP *origOut, const char *tag)
 {
     if (origOut) *origOut = NULL;
+    (void)tag;      // ★ 2.1-1：诊断日志移除后 tag 不再使用（保留参数位，
+                    //   将来若要恢复留痕不必动 5 个调用点）
     @try {
         if (!cls || !sel || !newImp) return NO;
 
         // ★ 先确认方法真的存在：对不存在的方法调用 MSHookMessageEx
         //   会「成功」地造出一个新方法，之后没人会调它 —— 属于静默失败。
         Method m = class_getInstanceMethod(cls, sel);
-        if (!m) {
-            NLWDiagAdd([NSString stringWithFormat:
-                @"[hook] %s 不存在（类 %s）", tag, class_getName(cls)]);
-            return NO;
-        }
+        if (!m) return NO;
 
         const char *enc = method_getTypeEncoding(m);
-        if (!NLWLooksLikeNoArgGetter(enc)) {
-            NLWDiagAdd([NSString stringWithFormat:
-                @"[hook] %s 编码像是有参数，跳过 enc=%s",
-                tag, enc ? enc : "(null)"]);
-            return NO;
-        }
+        if (!NLWLooksLikeNoArgGetter(enc)) return NO;
 
         // ---- 路径 1：MSHookMessageEx（与实测生效的插件同一条路）----
         NLWMSHookFn ms = NLWGetMSHook();
@@ -1347,31 +1071,18 @@ static BOOL NLWInstallBoolGetterHook(Class cls, SEL sel, IMP newImp,
             }
             if (prev) {
                 if (origOut) *origOut = prev;
-                NLWDiagAdd([NSString stringWithFormat:
-                    @"[hook] %s 已装上(ms) enc=%s orig=%p", tag, enc, (void *)prev]);
                 return YES;
             }
-            NLWDiagAdd([NSString stringWithFormat:
-                @"[hook] %s MSHook 失败，回退自实现", tag]);
-        } else {
-            NLWDiagAdd([NSString stringWithFormat:
-                @"[hook] %s 无 MSHookMessageEx，用自实现", tag]);
         }
 
         // ---- 路径 2：自实现（1.7-1 用过的那套，作为兜底保留）----
         IMP o = NULL;
         if (NLWInstallHook(cls, sel, newImp, &o, enc)) {
             if (origOut) *origOut = o;
-            NLWDiagAdd([NSString stringWithFormat:
-                @"[hook] %s 已装上(self) enc=%s orig=%p", tag, enc, (void *)o]);
             return YES;
         }
-
-        NLWDiagAdd([NSString stringWithFormat:
-            @"[hook] %s 两条路径都失败 enc=%s", tag, enc ? enc : "(null)"]);
         return NO;
     } @catch (NSException *e) {
-        NLWDiagAdd([NSString stringWithFormat:@"[hook] %s 安装异常（已忽略）", tag]);
         return NO;
     }
 }
@@ -1383,22 +1094,6 @@ static IMP        gOrigHasCameraBtn  = NULL;   // -hasCamera
 static IMP        gOrigLSCamInst2    = NULL;   // -lockScreenCameraSupported 实例
 static IMP        gOrigLSCamMeta2    = NULL;   // -lockScreenCameraSupported 类
 
-static NSUInteger gHintFlashlight = 0;
-static NSUInteger gHintCameraBtn  = 0;
-static NSUInteger gHintLSCam      = 0;
-
-/// 前 6 次命中留痕。★ 只用于「区分没生效和崩了」，不是功能的一部分。
-static void NLWNoteCamHit(NSUInteger *counter, const char *tag)
-{
-    @try {
-        if (*counter < 6) {
-            (*counter)++;
-            NLWDiagAdd([NSString stringWithFormat:
-                @"[%s#%lu] -> NO", tag, (unsigned long)*counter]);
-        }
-    } @catch (NSException *e) { }
-}
-
 /// 统一的三段式：关着就转发原实现；该禁就返回 NO；orig 丢了就放行。
 ///
 /// ★★ 2.0-1：这里原本是 `off = (gEnabled && (FLAG));` —— **必须去掉 gEnabled**。
@@ -1407,20 +1102,18 @@ static void NLWNoteCamHit(NSUInteger *counter, const char *tag)
 ///   相机按钮/左滑/手电筒三项立刻全部失效 —— 就是用户报的第 1 个 bug。
 ///   现在 gEnabled 只代表长按自己，与相机三项**无任何关系**；总开关由
 ///   gMasterEnabled 在 NLWLoadSwitches() 里做掩码，不进任何 hook 体。
-#define NLW_CAM_HOOK_BODY(FLAG, ORIG, TAG, COUNTER)                            \
+#define NLW_CAM_HOOK_BODY(FLAG, ORIG)                                          \
     BOOL off = NO;                                                             \
     @try { off = (FLAG); } @catch (NSException *e) { }                          \
     if (!off) {                                                                \
         if (ORIG) return ((BOOL (*)(id, SEL))(ORIG))(self, _cmd);              \
         return YES;                                                            \
     }                                                                          \
-    NLWNoteCamHit(&(COUNTER), TAG);                                            \
     return NO;
 
 static BOOL NLWHookHasFlashlight(id self, SEL _cmd)
 {
-    NLW_CAM_HOOK_BODY(gBlockFlashlight, gOrigHasFlashlight,
-                      "flashlight", gHintFlashlight)
+    NLW_CAM_HOOK_BODY(gBlockFlashlight, gOrigHasFlashlight)
 }
 
 static BOOL NLWHookHasCameraBtn(id self, SEL _cmd)
@@ -1438,20 +1131,17 @@ static BOOL NLWHookHasCameraBtn(id self, SEL _cmd)
     //
     //   所以这里选择让状态自洽：**只要左滑被禁，按钮就一起隐藏**。
     //   宁可少一个按钮，也不给一个按不动的按钮。
-    NLW_CAM_HOOK_BODY((gBlockCameraButton || gBlockCameraSwipe), gOrigHasCameraBtn,
-                      "camerabtn", gHintCameraBtn)
+    NLW_CAM_HOOK_BODY((gBlockCameraButton || gBlockCameraSwipe), gOrigHasCameraBtn)
 }
 
 static BOOL NLWHookLSCamInst(id self, SEL _cmd)
 {
-    NLW_CAM_HOOK_BODY(gBlockCameraSwipe, gOrigLSCamInst2,
-                      "lscam", gHintLSCam)
+    NLW_CAM_HOOK_BODY(gBlockCameraSwipe, gOrigLSCamInst2)
 }
 
 static BOOL NLWHookLSCamMeta(id self, SEL _cmd)
 {
-    NLW_CAM_HOOK_BODY(gBlockCameraSwipe, gOrigLSCamMeta2,
-                      "lscam-meta", gHintLSCam)
+    NLW_CAM_HOOK_BODY(gBlockCameraSwipe, gOrigLSCamMeta2)
 }
 
 #undef NLW_CAM_HOOK_BODY
@@ -1464,9 +1154,7 @@ static void NLWInstallCameraTriple(void)
 
         // ---- 类 1：CSQuickActionsViewController（手电筒 + 相机按钮）----
         Class cs = NSClassFromString(@"CSQuickActionsViewController");
-        if (!cs) {
-            NLWDiagAdd(@"[hook] CSQuickActionsViewController 类不存在 → 手电筒/相机按钮无法拦");
-        } else {
+        if (cs) {
             if (NLWInstallBoolGetterHook(cs, @selector(hasFlashlight),
                                         (IMP)NLWHookHasFlashlight,
                                         &gOrigHasFlashlight, "hasFlashlight")) {
@@ -1484,9 +1172,7 @@ static void NLWInstallCameraTriple(void)
         //   两个 hook 体分别用各自的 orig，绝不共用 —— 共用会转发到
         //   另一张方法表的原实现，那是必错。
         Class sb = NSClassFromString(@"SpringBoard");
-        if (!sb) {
-            NLWDiagAdd(@"[hook] SpringBoard 类不存在 → 左滑无法拦");
-        } else {
+        if (sb) {
             BOOL gotI = NLWInstallBoolGetterHook(sb,
                             @selector(lockScreenCameraSupported),
                             (IMP)NLWHookLSCamInst,
@@ -1505,11 +1191,10 @@ static void NLWInstallCameraTriple(void)
             }
         }
 
-        NLWDiagAdd([NSString stringWithFormat:
-            @"[hook] 相机三件套装配完成：%d/3 装上", okCount]);
-    } @catch (NSException *e) {
-        NLWDiagAdd(@"[hook] 装配异常（已忽略，宿主必须照常启动）");
-    }
+        // okCount 只用于确认「至少装上一个」；全部失败时不再静默 ——
+        // 但也不能在这里做任何补救动作（装不上就装不上，不能硬来）。
+        (void)okCount;
+    } @catch (NSException *e) { }
 }
 
 // ============================================================================
@@ -1522,11 +1207,6 @@ static void NLWAddGestureRecognizer(id self, SEL _cmd, UIGestureRecognizer *g)
 {
     BOOL hit = NO;
     @try {
-        // ★ 诊断（1.3-1 临时）：**放在开关判断之前**。
-        //   即使总开关关着也要记录 —— 否则「开关是不是没读对」这件事
-        //   也会变成盲区。记录本身有早退（非滑动类直接返回），开销可忽略。
-        NLWDiagNoteGesture(g, (UIView *)self, "add");
-
         // 三道便宜过滤：
         //   ① 总开关关着 → 不过问
         //   ② 不是「长按」也不是「相机滑动」→ 立刻放过（绝大多数调用走这条路）
@@ -1620,15 +1300,11 @@ static void NLWSetEnabled(id self, SEL _cmd, BOOL enabled)
                 //   这里也必须去掉 gEnabled —— 相机入口只由相机那一项说了算。
                 if (gBlockCameraSwipe) {
                     block = YES;
-                    NLWDiagNoteEnable(n, YES);
                 }
-            } else if (NLWIsCameraEntryCandidateClass(n)) {
-                // ★ 候选类（EdgeSwipe / Grabber 等）只记录、不拦截。
-                //   它们更可能是「边缘手势仲裁器」而非相机本身，
-                //   拦下来会破坏仲裁，可能让别的边缘手势失灵。
-                //   记录它们的启用时机，用来在日志里确认谁真正负责相机。
-                NLWDiagNoteEnable(n, NO);
             }
+            // ★ 候选类（EdgeSwipe / Grabber 等）**只记录、不拦截**，正式版
+            //   里连记录也去掉了 —— 直接不进入任何分支，一律原样转发。
+            //   它们更可能是「边缘手势仲裁器」而非相机本身，拦下来会破坏仲裁。
         }
     } @catch (NSException *e) { }
 
@@ -1643,19 +1319,6 @@ static void NLWDidMoveToWindow(id self, SEL _cmd)
 {
     @try { NLWProcessView((UIView *)self); }
     @catch (NSException *e) { }
-
-    // ★ 诊断（1.3-1 临时）：锁屏类视图**自身**挂的手势也要记一笔。
-    //   NLWProcessView 只在「可压制区」判据成立时才去遍历手势；
-    //   如果相机手势的宿主恰好被那个判据挡住，就永远看不到它 ——
-    //   而那恰恰是本次要查的核心疑点。这里单独扫，绕过该判据。
-    @try {
-        UIView *v = (UIView *)self;
-        if (v && NLWIsLockScreenish(v)) {
-            for (UIGestureRecognizer *g in v.gestureRecognizers) {
-                NLWDiagNoteGesture(g, v, "ls");
-            }
-        }
-    } @catch (NSException *e) { }
 
     if (gOrigDidMove) ((void (*)(id, SEL))gOrigDidMove)(self, _cmd);
 }
@@ -1771,13 +1434,6 @@ static void NLWOnPrefsChanged(CFNotificationCenterRef center, void *observer,
             // 关 → 开：什么也不用做。后续视图上屏 / 锁屏出现时，
             //          hook 会因为开关变回 YES 而重新压制。
 
-            // ★ 2.0-1：把「插件认为的有效开关值」打出来。
-            //   总开关关掉时后面四项应当全为 0（掩码后的值）；
-            //   与设置页勾选不一致 = 读取出了问题，一眼能看出来。
-            NLWDiagAdd([NSString stringWithFormat:
-                @"[sw] master=%d longpress=%d flash=%d btn=%d swipe=%d",
-                (int)gMasterEnabled, (int)gEnabled, (int)gBlockFlashlight,
-                (int)gBlockCameraButton, (int)gBlockCameraSwipe]);
         } @catch (NSException *e) { }
     });
 }
@@ -1806,14 +1462,6 @@ __attribute__((constructor)) static void NLWInit(void)
 
         // ★ 开关状态读一次，之后热路径只读内存里的 BOOL。
         NLWLoadSwitches();
-
-        // ★ 2.0-1：启动时就把「有效开关值」写进日志。
-        //   总开关关掉时后面四项应当是 0（掩码后的值）——
-        //   这条线直接回答「插件到底认不认我的开关」。
-        NLWDiagAdd([NSString stringWithFormat:
-            @"[sw] master=%d longpress=%d flash=%d btn=%d swipe=%d",
-            (int)gMasterEnabled, (int)gEnabled, (int)gBlockFlashlight,
-            (int)gBlockCameraButton, (int)gBlockCameraSwipe]);
 
         // ★ 即使当前是关闭状态也照样装 hook + 装通知监听：
         //   否则用户在设置页把开关打开后，没有任何机制让插件「醒过来」。

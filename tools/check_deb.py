@@ -616,23 +616,23 @@ def check_deb(path):
         for extra in (b"EdgePan", b"ScreenEdge"):
             chk("主 dylib 含类名兜底指纹 %s" % extra.decode(), extra in body,
                 "" if extra in body else "自定义边缘手势类的兜底判据失效")
-        # 日志已整体移除（用户要求：功能验证通过后，诊断代码只剩负担）
-        #
-        # ★ 1.3-1 是**诊断版**，故意带了一段临时记录代码（打到 /tmp 和
-        #   Logs 目录），用来定位「禁左滑进相机不生效」。所以判据不能一刀切
-        #   —— 否则诊断版必然 FAIL，而它恰恰是对的那个包。
-        # ★ 区分方式：诊断代码里有独一无二的格式串 "camSw="（记录相机开关
-        #   状态），正式版不会有。用产物指纹判，不依赖版本号字符串，
-        #   因为版本号可能被改而代码没动。
-        #   · 含 camSw 标记 = 诊断版 → 允许有日志路径
-        #   · 不含 camSw 标记 = 正式版 → 绝不允许有日志路径
-        _is_diag_build = b"camSw=" in body
-        chk("主 dylib 不含日志路径 NoLockWallpaper/nlw.log",
-            _is_diag_build or (b"/Logs/NoLockWallpaper" not in body),
-            "" if _is_diag_build
-            else ("日志代码未清干净" if b"/Logs/NoLockWallpaper" in body else ""))
-        if _is_diag_build:
-            print("     ↑ 检测到诊断标记 camSw= → 本包为诊断版，允许携带日志路径")
+        # ★★ 2.1-1 起这是**硬判据**，不再有「诊断版豁免」。
+        #   1.3-1 ~ 2.0-1 期间为了定位问题保留了一段临时诊断代码
+        #   （打到 /tmp 和 Logs 目录），当时用 "camSw=" 这个格式串来
+        #   区分「诊断版」和「正式版」，诊断版允许带日志路径。
+        #   现在诊断段已整块删除，正式交付包里出现任何一个日志痕迹
+        #   都是缺陷 —— SpringBoard 里做文件 IO 是 watchdog 风险，
+        #   而且日志会无限增长。所以这里改成逐项硬查：
+        #     · 日志目录路径
+        #     · 两个日志文件名
+        #     · 诊断段独有的格式串（证明它真的被删掉了，不是被注释掉）
+        for _needle, _why in ((b"/Logs/NoLockWallpaper", "日志目录路径还在"),
+                              (b"diag.txt", "诊断文件名还在"),
+                              (b"nlw_diag", "/tmp 诊断文件名还在"),
+                              (b"camSw=", "诊断格式串还在（诊断段没删干净）"),
+                              (b"MSHookMessageEx=%p", "装配日志还在")):
+            chk("主 dylib 不含诊断痕迹 %s" % _needle.decode(),
+                _needle not in body, "" if _needle not in body else _why)
 
 
 def main():

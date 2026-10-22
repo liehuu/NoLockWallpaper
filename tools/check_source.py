@@ -541,13 +541,16 @@ chk("硬判定只认 Camera / HorizontalScrollFailure 两类",
     "" if re.search(r'strstr\(n,\s*"HorizontalScrollFailure"\)', src) else
     "缺少 HorizontalScrollFailure → 拦不住锁屏相机入口")
 
-chk("候选类只记录、不拦截",
-    # ★ _UIPendingEdgeSwipe / UIImmediateEdgeSwipe 是 UIKit 的边缘手势仲裁器，
-    #   拦它们会破坏仲裁，可能让别的边缘手势失灵。
-    #   本版对它们只记录 enable 时机，用来在日志里确认职责。
-    re.search(r"NLWDiagNoteEnable\(n,\s*NO\);", code) is not None,
-    "" if "NLWDiagNoteEnable(n, NO);" in code else
-    "候选类被一起拦了 → 边缘手势仲裁可能失效")
+chk("正式版不碰候选类（EdgeSwipe / Grabber 一律原样放行）",
+    # ★ 1.6-1 ~ 2.0-1 期间，这些类只在诊断时「记录启用时机、不拦截」。
+    #   2.1-1 把诊断整块删掉后，连记录也没有了 —— 直接不进入任何分支。
+    #   为什么必须坚持「不碰」：_UIPendingEdgeSwipe / UIImmediateEdgeSwipe
+    #   是 UIKit 的边缘手势仲裁器，拦它们会破坏仲裁、让别的边缘手势失灵。
+    "NLWIsCameraEntryCandidateClass" not in code and
+    "NLWDiagNoteEnable" not in code,
+    "" if ("NLWIsCameraEntryCandidateClass" not in code and
+           "NLWDiagNoteEnable" not in code) else
+    "候选类还在被处理 → 边缘手势仲裁可能失效")
 
 chk("压制循环里对相机入口类做了即时压制（hook 管将来，这里管现在）",
     # ★ 双保险：setEnabled hook 只能拦住「将来」的启用；
@@ -677,12 +680,16 @@ chk("★ 签名判据放宽到「无参」而不是「B@: 前缀」",
     "还在按 B@: 前缀硬卡 → 真机上大概率被误跳过（1.8-1 的实际故障）")
 
 chk("对不存在的方法先判空再装（MSHook 会「成功」地造出新方法）",
+    # ★ 2.1-1：诊断日志删掉后，写法从 `if (!m) { ...log...; return NO; }`
+    #   简化成 `if (!m) return NO;`。判据跟着接受两种形态 ——
+    #   **改实现必须同步改判据**，否则闸门会把正确代码判红。
     re.search(r"Method m = class_getInstanceMethod\(cls, sel\);",
               _hook_installer) is not None and
-    re.search(r"if\s*\(!m\)\s*\{", _hook_installer) is not None,
+    re.search(r"if\s*\(!m\)\s*(return NO;|\{)", _hook_installer) is not None,
     "" if (re.search(r"Method m = class_getInstanceMethod\(cls, sel\);",
                      _hook_installer) and
-           re.search(r"if\s*\(!m\)\s*\{", _hook_installer)) else
+           re.search(r"if\s*\(!m\)\s*(return NO;|\{)",
+                     _hook_installer)) else
     "不判存在就 MSHook → 静默失败且没人会调")
 
 chk("三个 orig 各自独立（共用会转发到另一张方法表的原实现）",
@@ -873,14 +880,13 @@ if os.path.isfile(_rootpl2) and m_master:
         "" if ("<string>%s</string>" % _mk) in _rp2 else
         "设置页没有总开关项 → 用户看不到也拨不到")
 
-# ★ 2.0-1 新增的诊断行。交付文档里已经承诺了 `[sw] master=...` 这一行，
-#   如果源码里没有，文档就是编的 —— 出问题时用户会照着找一行不存在的日志。
-#   查 src（含中文字面量会被存成 UTF-16，但这一行是纯 ASCII，走 __cstring）。
-_sw_log_cnt = src.count("[sw] master=")
-chk("诊断版打印 [sw] 有效开关值（启动 + 设置变化各一处）",
-    _sw_log_cnt >= 2,
-    "" if _sw_log_cnt >= 2 else
-    "只有 %d 处 → 设置页改了开关后看不到实际生效值" % _sw_log_cnt)
+# ★ 2.1-1：`[sw] master=...` 那行诊断日志已随诊断段整块删除。
+#   这里保留一条**反向**判据：正式版里不许再出现它 ——
+#   防止有人把 2.0-1 的诊断段粘回来（那会重新引入 SpringBoard 里的文件 IO）。
+chk("正式版无 [sw] 诊断行（已随诊断段移除）",
+    src.count("[sw] master=") == 0,
+    "" if src.count("[sw] master=") == 0 else
+    "仍有 %d 处 → 诊断段被粘回来了" % src.count("[sw] master="))
 
 # ★ 设置变化时必须「任一项由开变关」就恢复，不能只看某一个开关。
 #   1.9-1 只看 gEnabled，用户「只关左滑」时已压制的手势不会恢复。
@@ -1274,28 +1280,42 @@ chk("有「锁屏主窗口宿主」判据",
     "" if "static BOOL NLWIsLockScreenWindowHost(UIView *v)" in code else
     "缺它就覆盖不到「相机手势挂在锁屏窗口视图树上」这种情况")
 
-chk("诊断不再只记录 pan 类（否则永远看不见相机手势）",
-    # ★ 这是本轮最要紧的一条：上一版的早退条件
-    #   `if (!isEdge && !NLWIsPanish(g)) return;` 直接把非 pan 类丢掉了，
-    #   而相机手势恰恰就是非 pan 类 —— 诊断自己制造了盲区。
-    re.search(r"if\s*\(!isEdge\s*&&\s*!isPan\s*&&\s*!sysHost\s*&&\s*!sup\)\s*return;",
-              code) is not None,
-    "" if "!isEdge && !isPan && !sysHost && !sup" in code else
-    "诊断仍只记滑动类 → 非 pan 的相机手势永远查不到")
+# ★ 原「诊断不再只记录 pan 类」也随诊断段删除 —— 见上面那段说明。
+#   这里保留一条**负向**要求：正式版源码里不得再出现任何诊断过滤逻辑
+#   （防止有人把 1.5-1 的诊断段整段粘回来，把盲区一起带回来）。
+chk("正式版无诊断过滤逻辑（防诊断段被粘回）",
+    "isEdge && !isPan" not in code and "!isEdge && !isPan" not in code,
+    "" if ("isEdge && !isPan" not in code and
+           "!isEdge && !isPan" not in code) else
+    "诊断过滤逻辑又出现了 → 非 pan 的相机手势会被它筛掉")
 
-chk("诊断记录 swipe 的方向值",
-    re.search(r"\(UISwipeGestureRecognizer \*\)g\)\.direction", code) is not None,
-    "" if "UISwipeGestureRecognizer *)g).direction" in code else
-    "不记 direction 就无法区分左滑/右滑")
+# ★★★ 2.1-1 的核心判据：**正式版零日志写盘**。
+#   1.3-1 起为了定位问题加的诊断段（写 diag.txt / nlw_diag.txt、
+#   200 行缓冲、后台 debounce 落盘）必须在交付前整块消失。
+#   留着它不只是「多几行代码」：SpringBoard 里任何文件 IO 都是
+#   watchdog 风险，而且日志会无限增长。
+chk("★ 正式版零日志写盘（诊断段已整块移除）",
+    not any(x in src for x in ("NLWDiagAdd", "NLWDiagNote", "NLWNoteCamHit",
+                               "NLWDiagFlushNow", "gDiagLock", "gDiagLines",
+                               "diag.txt", "nlw_diag", "writeToFile:")) and
+    "NSMutableArray *gDiag" not in code,
+    "" if not any(x in src for x in ("NLWDiagAdd", "NLWDiagNote",
+                                     "NLWNoteCamHit", "NLWDiagFlushNow",
+                                     "gDiagLock", "gDiagLines", "diag.txt",
+                                     "nlw_diag", "writeToFile:")) else
+    "仍有诊断残留：%s" % ", ".join(
+        x for x in ("NLWDiagAdd", "NLWDiagNote", "NLWNoteCamHit",
+                    "NLWDiagFlushNow", "gDiagLock", "gDiagLines",
+                    "diag.txt", "nlw_diag", "writeToFile:") if x in src))
 
-chk("诊断的 desc 不再限定 pan 类",
-    # ★ 1.4-1 把 desc 包在 `if (NLWIsPanish(g))` 里，
-    #   结果最可疑的非 pan 类连 description 都没有 —— 等于对盲区失明。
-    re.search(r"if\s*\(NLWIsPanish\(g\)\)\s*\{\s*\n\s*NSString \*d = \[g description\]",
-              code) is None,
-    "" if re.search(r"if\s*\(NLWIsPanish\(g\)\)\s*\{\s*\n\s*NSString \*d = \[g description\]",
-                    code) is None else
-    "desc 仍只对 pan 类记录 → 非 pan 手势看不到 target 是谁")
+# ★★ 这里原本还有三条「诊断代码自身的质量」判据：
+#     · 诊断不再只记录 pan 类
+#     · 诊断记录 swipe 的方向值
+#     · 诊断的 desc 不再限定 pan 类
+#   2.1-1 把诊断段整块删除后，这三条失去检查对象 —— 留着只会是空转。
+#   它们守的教训已由「正式版零日志写盘」那条统一兜住：
+#   **只要诊断段回不来，那三条描述的问题就不可能再发生。**
+#   教训本身留在文档里（见 诊断说明.txt 附录），不留在代码里。
 
 chk("系统手势窗口放行但不放弃热路径优化",
     # ★ 正形态：if (!areaOK && !sysHost(v) && !lockScreenWindowHost(v)) return 0;

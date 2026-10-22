@@ -94,7 +94,25 @@ env:
   #      宁可少一个按钮，也不给一个按不动的按钮。
   #      已经查证（Apple 官方文档 + 多个资料源）：系统不存在「只禁左滑
   #      而保留相机按钮」的开关，越狱插件层面同样是一刀切。
-  VERSION: 2.0-1
+  # ★ 2.1-1：**正式交付版**。功能与 2.0-1 完全一致（用户已实测通过），
+  #   唯一变化是把 1.3-1 起积累的临时诊断代码**整块删除**。
+  #   删掉的东西（约 340 行，Tweak.m 从 1600+ 行降到 1400 行）：
+  #     NLWDiagFlushNow / NLWDiagAdd（200 行缓冲 + 2 秒 debounce 落盘）
+  #     NLWDiagNoteEnable（setEnabled 留痕）/ NLWDiagNoteGesture（手势现场）
+  #     NLWNoteCamHit + 三个计数器 gHint*
+  #     写 /var/mobile/Library/Logs/NoLockWallpaper/diag.txt 与 /tmp/nlw_diag.txt
+  #     装配日志（[ms] / [hook] / [sw]）
+  #   ★ 为什么必须删 —— 这不是「代码整洁」问题：
+  #     ① SpringBoard 里做文件 IO 是 watchdog 杀进程的经典成因，
+  #        哪怕已经在后台队列 + debounce，也是不该长期留着的风险面；
+  #     ② 日志文件会无限增长，用户不会去清；
+  #     ③ 诊断段自己出过两次乌龙（过滤条件制造盲区、判据查到自己），
+  #        留着它等于留着一块没人再验证的代码。
+  #   ★ 同步改动：
+  #     · check_source 把「诊断版打印 [sw]」改成「正式版零日志写盘」硬判据；
+  #     · check_deb 取消「诊断版豁免」，日志痕迹逐项硬查；
+  #     · verify_negative 里 9 条基于诊断片段的用例换成正式版视角的注入。
+  VERSION: 2.1-1
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 

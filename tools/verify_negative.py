@@ -290,16 +290,12 @@ CASES = [
     ),
     (
         # ★ 本轮最要紧的一条：诊断自己制造盲区
-        "诊断退回只记滑动类（非 pan 的相机手势永远查不到）",
-        "if (!isEdge && !isPan && !sysHost && !sup) return;",
-        "if (!isEdge && !isPan) return;",
-        "诊断不再只记录 pan 类",
-    ),
-    (
-        "诊断的 desc 恢复成只对 pan 类记录（盲区失明）",
-        "            NSString *d = [g description];",
-        "            if (NLWIsPanish(g)) {\n            NSString *d = [g description];",
-        "诊断的 desc 不再限定 pan 类",
+        "★ 把 1.5-1 的诊断过滤逻辑粘回来（非 pan 的相机手势会被筛掉）",
+        "    BOOL hit = NO;\n    @try {\n        // 三道便宜过滤：",
+        "    BOOL hit = NO;\n    @try {\n"
+        "        if (!isEdge && !isPan) return;\n"
+        "        // 三道便宜过滤：",
+        "正式版无诊断过滤逻辑",
     ),
     # ---- 1.6-1 新增：拦「启用」而非「改状态」的六条回归 ----
     #
@@ -334,10 +330,11 @@ CASES = [
     ),
     (
         # ★ 误伤方向：把边缘手势仲裁器也拦了
-        "候选类被一起拦截（边缘手势仲裁失效）",
-        "                NLWDiagNoteEnable(n, NO);",
-        "                NLWDiagNoteEnable(n, YES); block = YES;",
-        "候选类只记录、不拦截",
+        "★ 把「候选类」处理函数加回来（正式版应完全不碰它们）",
+        "// ---- 三个 hook 的原实现与调用计数 ----",
+        "static BOOL NLWIsCameraEntryCandidateClass(const char *n) { return n != 0; }\n"
+        "// ---- 三个 hook 的原实现与调用计数 ----",
+        "正式版不碰候选类",
     ),
     (
         "硬判定漏掉 HorizontalScrollFailure（拦不住锁屏相机入口）",
@@ -363,9 +360,9 @@ CASES = [
     (
         "★ 不判方法存在就 MSHook（会对不存在的方法「成功」造出新方法，没人调）",
         "        Method m = class_getInstanceMethod(cls, sel);\n"
-        "        if (!m) {\n",
+        "        if (!m) return NO;\n",
         "        Method m = class_getInstanceMethod(cls, sel);\n"
-        "        if (NO) {\n",
+        "        if (NO) return NO;\n",
         "对不存在的方法先判空再装",
     ),
     (
@@ -383,8 +380,8 @@ CASES = [
     ),
     (
         "★ 签名判据退回 B@: 前缀硬卡（真机上是 B16@: / B@:8 → 静默跳过）",
-        "        if (!NLWLooksLikeNoArgGetter(enc)) {",
-        '        if (!enc || strncmp(enc, "B@:", 3) != 0) {',
+        "        if (!NLWLooksLikeNoArgGetter(enc)) return NO;",
+        '        if (!enc || strncmp(enc, "B@:", 3) != 0) return NO;',
         "★ 签名判据放宽到「无参」而不是「B@: 前缀」",
     ),
     (
@@ -404,8 +401,8 @@ CASES = [
     (
         "★ 相机按钮 hook 错用了手电筒的开关（拨一个动两个）",
         "    NLW_CAM_HOOK_BODY((gBlockCameraButton || gBlockCameraSwipe), "
-        "gOrigHasCameraBtn,",
-        "    NLW_CAM_HOOK_BODY(gBlockFlashlight, gOrigHasCameraBtn,",
+        "gOrigHasCameraBtn)",
+        "    NLW_CAM_HOOK_BODY(gBlockFlashlight, gOrigHasCameraBtn)",
         "三个 hook 体分别引用自己的 orig 与自己的开关",
     ),
     (
@@ -492,8 +489,8 @@ CASES = [
     (
         "★★ hasCamera 只看按钮开关（禁左滑时会出现一个按不动的按钮）",
         "    NLW_CAM_HOOK_BODY((gBlockCameraButton || gBlockCameraSwipe), "
-        "gOrigHasCameraBtn,",
-        "    NLW_CAM_HOOK_BODY(gBlockCameraButton, gOrigHasCameraBtn,",
+        "gOrigHasCameraBtn)",
+        "    NLW_CAM_HOOK_BODY(gBlockCameraButton, gOrigHasCameraBtn)",
         "hasCamera 同时看 gBlockCameraButton 与 gBlockCameraSwipe",
     ),
     (
@@ -514,11 +511,11 @@ CASES = [
         "★★ 总开关散进 hook 体（掩码之外再判一次 = 两套语义）",
         "static BOOL NLWHookHasFlashlight(id self, SEL _cmd)\n"
         "{\n"
-        "    NLW_CAM_HOOK_BODY(gBlockFlashlight, gOrigHasFlashlight,",
+        "    NLW_CAM_HOOK_BODY(gBlockFlashlight, gOrigHasFlashlight)",
         "static BOOL NLWHookHasFlashlight(id self, SEL _cmd)\n"
         "{\n"
         "    if (!gMasterEnabled) return YES;\n"
-        "    NLW_CAM_HOOK_BODY(gBlockFlashlight, gOrigHasFlashlight,",
+        "    NLW_CAM_HOOK_BODY(gBlockFlashlight, gOrigHasFlashlight)",
         "总开关不进任何 hook 体",
     ),
     (
@@ -540,10 +537,12 @@ CASES = [
         "有独立的总开关键 NLWMasterKey",
     ),
     (
-        "★★ 去掉 [sw] 有效开关日志（出问题时看不出插件认的是哪个值）",
-        "[sw] master=%d longpress=%d flash=%d btn=%d swipe=%d",
-        "[sw-off] diag disabled",
-        "诊断版打印 [sw] 有效开关值",
+        "★★ 把诊断写盘代码粘回来（SpringBoard 里做文件 IO = watchdog 风险）",
+        "// ---- 三个 hook 的原实现与调用计数 ----",
+        'static void NLWDiagAdd(NSString *x) { [x writeToFile:@"/tmp/nlw_diag.txt"'
+        ' atomically:YES encoding:NSUTF8StringEncoding error:NULL]; }\n'
+        "// ---- 三个 hook 的原实现与调用计数 ----",
+        "正式版零日志写盘",
     ),
     (
         "★★ 设置变化只看长按开关（关别的项时已压制手势不恢复）",
