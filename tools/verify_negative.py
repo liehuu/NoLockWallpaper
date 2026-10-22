@@ -393,6 +393,18 @@ MKDEB_CASES = [
         "printf '再重启桌面，插件将完全不再动手。删掉该文件即恢复。",
         "postinst 里不重启桌面",
     ),
+    (
+        # ★ 真实缺陷原样复现（1.0-1 ~ 1.2-1 首版一直存在，装了 3 个版本才发现）：
+        #   data.tar 里带着 ./DEBIAN/postinst → 解包落到根目录 /DEBIAN/postinst。
+        #   rootless 上 / 只读 → 整个 deb 装不上。
+        "data.tar 里带上 DEBIAN/（rootless 上 / 只读 → 整个包装不上）",
+        "            rel_root = os.path.relpath(root, stage).replace('\\\\', '/')\n"
+        "            if rel_root == 'DEBIAN' or rel_root.startswith('DEBIAN/'):\n"
+        "                dirs[:] = []\n"
+        "                continue",
+        "            rel_root = os.path.relpath(root, stage).replace('\\\\', '/')",
+        "遍历时剪掉 DEBIAN/",
+    ),
 ]
 
 

@@ -14,6 +14,9 @@ env:
   #   dpkg 事务未收尾（status 没写完、lock 没释放）→ 用户手机锁残留 + 半装，
   #   之后任何 deb 都装不上。这是**发出去的坏版本**，必须换号重发，
   #   否则用户会以为是同一个包、不敢再试。
+  # ★ 1.2-1 首版 CI 绿了但下载产物后发现第二个缺陷：data.tar 里也打了
+  #   ./DEBIAN/postinst（dpkg 会解到根目录 /DEBIAN）。rootless 上 / 只读
+  #   → 整个包装不上。也在这一版修掉，所以 1.2-1 没有对外发过。
   VERSION: 1.2-1
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1

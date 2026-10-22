@@ -373,6 +373,20 @@ def check_deb(path):
     for nm, mode, size, isf in entries:
         print("    %-70s %04o %8d %s" % (nm, mode, size, "f" if isf else "d"))
 
+    # ★★ data.tar 里绝不能出现 DEBIAN/（2026-10-22 发现的真实缺陷）：
+    #   dpkg 只从 control.tar.gz 读 control/postinst。data.tar 里若也带了
+    #   ./DEBIAN/postinst，dpkg 会把它当普通文件解到文件系统根目录的
+    #   /DEBIAN/postinst ——
+    #     · rootful：根目录多一份垃圾，卸载脚本不会清理它
+    #     · rootless：/ 只读 → 解包直接失败，整个 deb 装不上
+    #   这个缺陷 1.0-1 / 1.1-1 一直存在，只是恰好 rootful 上不致命。
+    _deb_in_data = [e[0] for e in entries
+                    if e[0].lstrip("./").split("/")[0].upper() == "DEBIAN"]
+    chk("data.tar 不含 DEBIAN/（否则解包会落到根目录 /DEBIAN）",
+        not _deb_in_data,
+        "实际含：%s —— rootless 上 / 只读会让整个包装不上" % _deb_in_data
+        if _deb_in_data else "")
+
     # Filter plist
     dylib_name = "%s.dylib" % EXPECT_NAME
     plist_name = "%s.plist" % EXPECT_NAME

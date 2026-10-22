@@ -202,6 +202,22 @@ def _tar():
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode='w', format=tarfile.GNU_FORMAT) as tf:
         for root, dirs, files in os.walk(stage):
+            # ★★ DEBIAN/ 绝不能进 data.tar（2026-10-22 发现的真实缺陷）：
+            #   dpkg 只从 control.tar 读控制文件。data.tar 里若也带着
+            #   ./DEBIAN/postinst，解包时会被落到文件系统根目录的
+            #   /DEBIAN/postinst ——
+            #     · rootful 上：往根目录塞垃圾文件，卸载不会清掉
+            #     · rootless 上：/ 是只读的 → 解包直接失败、
+            #       整个 deb 装不上（比垃圾文件严重得多）
+            #   这里用「相对路径第一段等于 DEBIAN 就整棵剪掉」，
+            #   比只跳过控制文件名更彻底（防止有人往 DEBIAN/ 里放别的）。
+            rel_root = os.path.relpath(root, stage).replace('\\', '/')
+            if rel_root == 'DEBIAN' or rel_root.startswith('DEBIAN/'):
+                dirs[:] = []
+                continue
+            if rel_root == '.':
+                # 根目录这一层把 DEBIAN 从待遍历子目录里剔掉
+                dirs[:] = [d for d in dirs if d != 'DEBIAN']
             dirs.sort()
             files.sort()
             for name in dirs:
