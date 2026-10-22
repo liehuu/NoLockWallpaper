@@ -137,8 +137,17 @@ static void NLWLog(NSString *msg)
             }
         }
         [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        // 锁屏时默认文件保护 Complete，未解锁前读不到；放宽到 UntilFirstAccess
-        [fm setAttributes:@{ NSFileProtectionKey : NSFileProtectionCompleteUntilFirstAccess }
+        // 锁屏时默认文件保护是 NSFileProtectionComplete，未解锁前读不到；
+        // 放宽到「首次解锁后即可读」，用户解锁后就能用 Filza 打开。
+        // ★ 常量名别记错：iOS 只有这四个
+        //     NSFileProtectionComplete
+        //     NSFileProtectionCompleteUnlessOpen
+        //     NSFileProtectionCompleteUntilFirstUserAuthentication  ← 本处用的
+        //     NSFileProtectionNone
+        //   「...UntilFirstAccess」是**不存在**的名字，写错会直接编译失败
+        //   （CI 实测：error: use of undeclared identifier）。
+        [fm setAttributes:@{ NSFileProtectionKey :
+                                 NSFileProtectionCompleteUntilFirstUserAuthentication }
              ofItemAtPath:path error:nil];
     } @catch (NSException *e) { }
 }
@@ -206,6 +215,26 @@ static BOOL NLWIsLockScreenish(id obj)
     return NO;
 }
 
+/// 是否「长按类」手势。
+///
+/// ★ 为什么不只判 isKindOfClass:[UILongPressGestureRecognizer class]：
+///   iOS 17 锁屏进入自定义模式用的手势，可能是系统自定义子类
+///   （继承 UILongPressGestureRecognizer 时 isKindOfClass 已经覆盖），
+///   但也存在「不继承、自己从 UIGestureRecognizer 派生」的实现可能。
+///   类名带 LongPress 的按名判一次，属于零成本兜底。
+///   ★ 为什么这个放宽不危险：本函数只在「已确认是锁屏壁纸区」之后才被调用，
+///     作用域已经被三重判据收窄；且只要有 LongPress 字样，语义上就是要压的。
+static BOOL NLWIsLongPressish(UIGestureRecognizer *g)
+{
+    if (!g) return NO;
+    if ([g isKindOfClass:[UILongPressGestureRecognizer class]]) return YES;
+    @try {
+        const char *n = class_getName(object_getClass(g));
+        if (n && strstr(n, "LongPress")) return YES;
+    } @catch (NSException *e) { }
+    return NO;
+}
+
 // ============================================================================
 //  四、压制动作
 // ============================================================================
@@ -222,12 +251,16 @@ static void NLWSuppressGesture(UIGestureRecognizer *g, const char *where)
     //   enabled=NO          → 常规手段
     //   minimumPressDuration → 万一系统把 enabled 改回 YES，
     //                         90 秒的长按人类按不出来，等于永久失效
-    @try { g.enabled = NO; } @catch (NSException *e) { }
+    // ★ 顺序不能反：先设 duration 再关 enabled。
+    //   minimumPressDuration 是 UILongPressGestureRecognizer 的属性，
+    //   必须在手势还「活着」的时候写；先 disable 再写有极小概率被
+    //   系统在 disable 时清理内部状态而忽略。
     @try {
         if ([g isKindOfClass:[UILongPressGestureRecognizer class]]) {
             ((UILongPressGestureRecognizer *)g).minimumPressDuration = 90.0;
         }
     } @catch (NSException *e) { }
+    @try { g.enabled = NO; } @catch (NSException *e) { }
 
     gSuppressedTotal++;
     if (gLoggedFirstSuppress) return;      // 热路径：只写一次盘
@@ -294,10 +327,16 @@ static NSUInteger NLWProcessView(UIView *v, const char *where)
     NSUInteger n = 0;
     @try {
         if (!v) return 0;
-        NSArray *gs = v.gestureRecognizers;     // nil 时 for-in 安全跳过
-        if (gs.count == 0) return 0;
 
+        // ★ 顺序很重要：先做判据、后取 gestureRecognizers。
+        //   v.gestureRecognizers 每次调用都会新建一个数组（视图无手势时返回
+        //   空数组而非 nil，仍会分配）。didMoveToWindow 是所有视图上屏的
+        //   热路径，SpringBoard 启动期几百个视图各走一遍 —— 先取数组等于
+        //   白分配几百次。判据只是类名比对，纳秒级且零分配，所以提到前面。
         if (!NLWIsSuppressibleLockScreenArea(v)) return 0;
+
+        NSArray *gs = v.gestureRecognizers;
+        if (gs.count == 0) return 0;
 
         // 首次找到可压制的锁屏区域：把手势清单整体记下来。
         // ★ 这是给「万一没生效」留的诊断口 —— 日志里能直接看到锁屏上
@@ -308,7 +347,9 @@ static NSUInteger NLWProcessView(UIView *v, const char *where)
             for (UIGestureRecognizer *g in gs) {
                 NSString *cn = @"?";
                 @try { cn = NSStringFromClass(object_getClass(g)); } @catch (NSException *e) { }
-                [inv appendFormat:@"        - %@  enabled=%d\n", cn, (int)g.enabled];
+                BOOL en = NO;
+                @try { en = g.enabled; } @catch (NSException *e) { }
+                [inv appendFormat:@"        - %@  enabled=%d\n", cn, (int)en];
             }
             NSString *vcls = @"?";
             @try { vcls = NSStringFromClass([v class]); } @catch (NSException *e) { }
@@ -318,7 +359,7 @@ static NSUInteger NLWProcessView(UIView *v, const char *where)
         }
 
         for (UIGestureRecognizer *g in gs) {
-            if ([g isKindOfClass:[UILongPressGestureRecognizer class]]) {
+            if (NLWIsLongPressish(g)) {
                 NLWSuppressGesture(g, where);
                 n++;
             }
@@ -333,7 +374,41 @@ static NSUInteger NLWProcessView(UIView *v, const char *where)
 
 static IMP gOrigAddGesture    = NULL;
 static IMP gOrigDidMove       = NULL;
-static IMP gOrigViewDidAppear = NULL;
+
+/// 是否「消息转发桩」而非真实实现。
+///
+/// ★★ 这是崩宿主的高危点，必须显式排除：
+///   class_getMethodImplementation / method_getImplementation 在
+///   「没人实现这个 selector」时可能给出 objc_msgForward（非 NULL 的转发桩）。
+///   若把它当成 orig 存下来再转发调用，等于把消息再送一次转发 ——
+///   arm64e 上会直接 EXC_BAD_ACCESS 或无限递归，SpringBoard 崩。
+///   因此 orig 必须「要么是真实 IMP，要么视为没拿到」。
+///
+/// ★★★ 为什么用 dlsym 取符号，而不是直接写 &_objc_msgForward：
+///   直接引用会在 dylib 的符号表里留下未定义符号绑定。本包用
+///   -undefined dynamic_lookup 链接，编译期不报错，但**运行期若 dyld
+///   找不到该符号，整份 dylib 加载失败** —— 表现就是「插件完全没生效，
+///   连一行日志都没有」，这正是我们反复踩过的坑。
+///   · _objc_msgForward_stret 在 arm64 上已从 libobjc 移除，
+///     绝不能直接引用（arm64 是唯一目标架构，引用=必崩加载）
+///   · 用 dlsym 拿到的是地址或 NULL，取不到也只是「这层保护不启用」，
+///     绝不影响 dylib 加载。防御代码本身不能成为加载失败的原因。
+static BOOL NLWIsForwardingIMP(IMP imp)
+{
+    if (!imp) return YES;
+
+    static void *fwd = NULL;
+    static void *fwdStret = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fwd      = dlsym(RTLD_DEFAULT, "_objc_msgForward");
+        fwdStret = dlsym(RTLD_DEFAULT, "_objc_msgForward_stret");
+    });
+
+    if (fwd && (void *)imp == fwd) return YES;
+    if (fwdStret && (void *)imp == fwdStret) return YES;
+    return NO;
+}
 
 /// 在 cls 上安装 sel 的替换实现。
 ///
@@ -341,33 +416,55 @@ static IMP gOrigViewDidAppear = NULL;
 ///   后者若直接 method_setImplementation，改的是**父类**的方法，
 ///   会污染父类的所有其他子类 —— 可能直接崩宿主。
 ///   正确做法是给 cls 单独 class_addMethod 一份，只影响它自己。
+///
+/// ★ 返回值语义：YES 表示已装好；NO 表示干净跳过（调用方必须不记 orig）。
+///   origOut 只会被写成「真实可调用的 IMP」，绝不含转发桩 —— 调用方因此
+///   可以放心用 if (orig) orig(...) 转发。
 static BOOL NLWInstallHook(Class cls, SEL sel, IMP newImp, IMP *origOut,
                            const char *typeEnc)
 {
     @try {
         if (!cls || !sel || !newImp) return NO;
+        if (origOut) *origOut = NULL;
 
         Class sup = class_getSuperclass(cls);
-        IMP curImp = class_getMethodImplementation(cls, sel);
-        if (!curImp) return NO;
 
-        IMP supImp = sup ? class_getMethodImplementation(sup, sel) : NULL;
+        // ★ 优先走 method_getImplementation 取「本类真实存在的方法」。
+        //   只有确实没找到时，才看 class_getMethodImplementation 是否
+        //   落在父类上（= 继承关系）。两条路径都要过转发桩过滤。
+        Method own = class_getInstanceMethod(cls, sel);
+        if (!own) return NO;                    // 类根本没有这个方法 → 干净跳过
 
-        if (supImp && curImp == supImp) {
+        IMP ownImp = method_getImplementation(own);
+        if (NLWIsForwardingIMP(ownImp)) return NO;   // 转发桩 → 干净跳过
+
+        Method supMethod = sup ? class_getInstanceMethod(sup, sel) : NULL;
+        BOOL inherited = NO;
+
+        if (supMethod && method_getImplementation(supMethod) == ownImp) {
+            // 本类方法表里这一项和父类指向同一个 IMP → 没被本类覆盖
+            inherited = YES;
+        }
+
+        if (inherited) {
             // 继承来的：只给 cls 加一份，父类原样不动
-            if (origOut) *origOut = supImp;
-            if (class_addMethod(cls, sel, newImp, typeEnc)) return YES;
+            if (class_addMethod(cls, sel, newImp, typeEnc)) {
+                if (origOut) *origOut = ownImp;
+                return YES;
+            }
+            // addMethod 失败（极少见：可能并发已有同名）→ 回退到改写本类 method
             Method m = class_getInstanceMethod(cls, sel);
             if (!m) return NO;
-            if (origOut) *origOut = method_getImplementation(m);
+            IMP cur = method_getImplementation(m);
+            if (NLWIsForwardingIMP(cur)) return NO;
+            if (origOut) *origOut = cur;
             method_setImplementation(m, newImp);
             return YES;
         }
 
-        Method m = class_getInstanceMethod(cls, sel);
-        if (!m) return NO;
-        if (origOut) *origOut = method_getImplementation(m);
-        method_setImplementation(m, newImp);
+        // 本类自己实现（或父类根本没有）→ 直接改写本类方法表
+        if (origOut) *origOut = ownImp;
+        method_setImplementation(own, newImp);
         return YES;
     } @catch (NSException *e) {
         return NO;
@@ -387,8 +484,10 @@ static void NLWAddGestureRecognizer(id self, SEL _cmd, UIGestureRecognizer *g)
         // 两道便宜过滤：
         //   ① 不是长按 → 立刻放过（绝大多数调用走这条路）
         //   ② 宿主不是「锁屏壁纸区」→ 放过（含通知/滚动容器/UIControl 排除判据）
-        // 函数内部已做完整判据，这里不重复判断，避免两处逻辑不一致。
-        if (g && [g isKindOfClass:[UILongPressGestureRecognizer class]]) {
+        // ★ 长按判断统一走 NLWIsLongPressish，与后面的压制循环用同一判据。
+        //   两处各写一套 isKindOfClass 迟早会不一致（一处放宽一处没放宽
+        //   → 判为命中却一个都没压，或者反过来漏压）。
+        if (NLWIsLongPressish(g)) {
             hit = NLWIsSuppressibleLockScreenArea((UIView *)self);
         }
     } @catch (NSException *e) { }
@@ -414,6 +513,30 @@ static void NLWDidMoveToWindow(id self, SEL _cmd)
 
 // ---- 第 2 层（补）：viewDidAppear: ----
 // 签名：- (void)viewDidAppear:(BOOL)animated   →  v@:B
+//
+// ★★ 为什么 orig 必须「一个类存一份」，不能共用一个全局变量：
+//   iOS 17 上 SBLockScreenViewController / CSCoverSheetViewController 里
+//   可能有两个甚至更多都真实存在。若只存第一个的 orig，第二个类的 orig
+//   就永远拿不到 → 它的原始 viewDidAppear: 再也不会被执行 →
+//   锁屏控制器自身逻辑被截断（黑屏、不刷新、卡死都可能）。
+//   所以按「类 → orig」成对存，转发时按 self 的实际类链找最精确的那份。
+
+#define NLW_MAX_CTL 4
+static Class gCtlCls[NLW_MAX_CTL];
+static IMP   gCtlOrig[NLW_MAX_CTL];
+static int   gCtlCount = 0;
+
+/// 按 self 的实际类链，找出对应的原始 viewDidAppear: 实现。
+static IMP NLWOrigViewDidAppearFor(id self)
+{
+    if (!self) return NULL;
+    for (Class k = object_getClass(self); k != Nil; k = class_getSuperclass(k)) {
+        for (int i = 0; i < gCtlCount; i++) {
+            if (gCtlCls[i] == k) return gCtlOrig[i];
+        }
+    }
+    return NULL;
+}
 
 /// 扫描「本视图 + 其直接子视图」自身挂载的长按手势。返回压制个数。
 ///
@@ -426,7 +549,9 @@ static void NLWDidMoveToWindow(id self, SEL _cmd)
 ///   通知列表 / 手电筒 / 相机都在同一层或更深，但它们**不在锁屏容器的
 ///   直接子视图链上带长按**（通知是 UICollectionView 的 cell 内长按，
 ///   属于更深层）。只下探一层既能覆盖壁纸容器，又不会误伤通知。
-///   ★ 若实测发现通知长按被影响，把这里改回只处理 0 层即可。
+///   而且 NLWProcessView 内部还有「路径经过 UIScrollView 即排除」这道
+///   独立防线，即使层级判断有偏差也不会误伤通知。
+///   ★ 若实测发现通知长按被影响，把这里改成只处理 0 层即可。
 static NSUInteger NLWProcessViewShallow(UIView *v, const char *where)
 {
     NSUInteger n = 0;
@@ -449,8 +574,12 @@ static void NLWViewDidAppear(id self, SEL _cmd, BOOL animated)
     @try { NLWProcessViewShallow([self view], "viewDidAppear:"); }
     @catch (NSException *e) { }
 
-    if (gOrigViewDidAppear)
-        ((void (*)(id, SEL, BOOL))gOrigViewDidAppear)(self, _cmd, animated);
+    // ★ 无论如何都要转发原实现 —— 这是锁屏控制器自己的生命周期回调，
+    //   不转发等于把锁屏的初始化流程砍掉，比「功能不生效」严重得多。
+    IMP o = NLWOrigViewDidAppearFor(self);
+    if (o && !NLWIsForwardingIMP(o)) {
+        ((void (*)(id, SEL, BOOL))o)(self, _cmd, animated);
+    }
 }
 
 // ============================================================================
@@ -495,6 +624,10 @@ __attribute__((constructor)) static void NLWInit(void)
         }
 
         // ---- 第 2 层：锁屏控制器 ----
+        // ★ 这三个类名是「都可能存在但不一定都存在」的关系：
+        //   iOS 13~15 用 SBLockScreenViewController，
+        //   iOS 16+ 逐步迁到 CSCoverSheetViewController。
+        //   哪个在就装哪个，都不在也不报错（干净跳过）。
         NSArray *ctlClasses = @[
             @"SBLockScreenViewController",
             @"SBLockScreenViewControllerBase",
@@ -502,12 +635,30 @@ __attribute__((constructor)) static void NLWInit(void)
         ];
         for (NSString *name in ctlClasses) {
             Class c = NSClassFromString(name);
-            if (!c) continue;
+            if (!c) {
+                [rep appendFormat:@"  [补] %@ 不存在（跳过）\n", name];
+                continue;
+            }
             IMP o = NULL;
             if (NLWInstallHook(c, @selector(viewDidAppear:),
                                (IMP)NLWViewDidAppear, &o, "v@:B")) {
-                if (!gOrigViewDidAppear && o) gOrigViewDidAppear = o;
-                [rep appendFormat:@"  [补] %@ -viewDidAppear:\n", name];
+                if (gCtlCount < NLW_MAX_CTL) {
+                    // ★ orig 按类成对存，绝不共用 —— 见 NLWOrigViewDidAppearFor
+                    gCtlCls[gCtlCount]  = c;
+                    gCtlOrig[gCtlCount] = o;
+                    gCtlCount++;
+                    [rep appendFormat:@"  [补] %@ -viewDidAppear:\n", name];
+                } else {
+                    // 槽位满：orig 存不下来就意味着该类的生命周期回调会被截断，
+                    // 风险高于「这层补丁少装一个」。宁可撤销 hook 也不能丢 orig。
+                    Method m = class_getInstanceMethod(c, @selector(viewDidAppear:));
+                    if (m && o && !NLWIsForwardingIMP(o)) {
+                        method_setImplementation(m, o);
+                    }
+                    [rep appendFormat:@"  [补] %@ 槽位已满，本层跳过（不影响主层）\n", name];
+                }
+            } else {
+                [rep appendFormat:@"  [补] %@ -viewDidAppear: 安装失败（跳过）\n", name];
             }
         }
 
