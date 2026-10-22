@@ -606,10 +606,23 @@ def check_deb(path):
         for extra in (b"EdgePan", b"ScreenEdge"):
             chk("主 dylib 含类名兜底指纹 %s" % extra.decode(), extra in body,
                 "" if extra in body else "自定义边缘手势类的兜底判据失效")
-        # 日志已整体移除（用户要求）
+        # 日志已整体移除（用户要求：功能验证通过后，诊断代码只剩负担）
+        #
+        # ★ 1.3-1 是**诊断版**，故意带了一段临时记录代码（打到 /tmp 和
+        #   Logs 目录），用来定位「禁左滑进相机不生效」。所以判据不能一刀切
+        #   —— 否则诊断版必然 FAIL，而它恰恰是对的那个包。
+        # ★ 区分方式：诊断代码里有独一无二的格式串 "camSw="（记录相机开关
+        #   状态），正式版不会有。用产物指纹判，不依赖版本号字符串，
+        #   因为版本号可能被改而代码没动。
+        #   · 含 camSw 标记 = 诊断版 → 允许有日志路径
+        #   · 不含 camSw 标记 = 正式版 → 绝不允许有日志路径
+        _is_diag_build = b"camSw=" in body
         chk("主 dylib 不含日志路径 NoLockWallpaper/nlw.log",
-            b"/Logs/NoLockWallpaper" not in body,
-            "" if b"/Logs/NoLockWallpaper" not in body else "日志代码未清干净")
+            _is_diag_build or (b"/Logs/NoLockWallpaper" not in body),
+            "" if _is_diag_build
+            else ("日志代码未清干净" if b"/Logs/NoLockWallpaper" in body else ""))
+        if _is_diag_build:
+            print("     ↑ 检测到诊断标记 camSw= → 本包为诊断版，允许携带日志路径")
 
 
 def main():
