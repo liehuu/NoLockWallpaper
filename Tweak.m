@@ -308,6 +308,167 @@ static BOOL NLWIsCameraSwipeish(UIGestureRecognizer *g, UIView *host)
 }
 
 // ============================================================================
+//  四点五、临时诊断（1.3-1 专用；定位完必须整块删除）
+// ============================================================================
+//
+// ★ 为什么要破例在热路径写文件：
+//   实机反馈「禁长按换壁纸生效，禁左滑进相机没生效」。
+//   长按能拦 ⇒ dylib 已加载、hook 已装上，问题在**判据没命中**。
+//   而判据为什么没命中，只有四种可能，仅凭描述无法区分：
+//     ① 相机手势根本不是 UIScreenEdgePanGestureRecognizer
+//     ② 是 edge pan，但 edges 不是 UIRectEdgeRight（可能是 Left / Both）
+//     ③ 宿主视图不在「锁屏可压制区域」内（被滚动容器或 UIControl 判据挡住）
+//     ④ hook 装得比手势添加晚（addGestureRecognizer 完全没拦到）
+//   靠猜改判据 = 反复返工，用户已经为这个问题多装过一次包了。
+//   本版只记录、不改任何判据，装一次就能把四个可能性一次排除。
+//
+// ★ 为什么不能直接把判据放宽成「压掉锁屏上所有 edge pan」：
+//   iOS 锁屏「右上角下滑呼出控制中心」也是边缘手势。放宽就等于
+//   顺带废掉控制中心 —— 那是比原问题更严重的误伤。
+//   所以必须先用真实 edges 值区分，再决定放宽到哪一档。
+//
+// ★ 风险控制（这段跑在 SpringBoard 热路径里，必须苛刻）：
+//   · 只记录滑动类手势（锁屏上数量是个位数），点击/长按一律早退
+//   · 同一手势指针只记一次（去重），上限 200 条，达上限立即停止
+//   · 只在后台队列写，2 秒 debounce，最多写 20 次
+//   · 全程 @try 包裹，任何异常都不外泄到调用方线程
+//   · 写两个位置（移动端 Logs 目录 + /tmp），任一能读到即可
+
+static NSMutableArray *gDiagLines   = nil;
+static NSMutableArray *gDiagSeen    = nil;   // NSValue 包手势指针，去重
+static NSObject       *gDiagLock    = nil;
+static BOOL            gDiagScheduled = NO;
+static int             gDiagFlushes   = 0;
+
+static void NLWDiagFlushNow(void)
+{
+    @autoreleasepool {
+        NSArray *snapshot = nil;
+        @synchronized (gDiagLock) {
+            gDiagScheduled = NO;
+            if (gDiagLines.count == 0) return;
+            snapshot = [gDiagLines copy];
+        }
+        @try {
+            NSString *body = [snapshot componentsJoinedByString:@"\n"];
+            NSFileManager *fm = [NSFileManager defaultManager];
+
+            // 位置一：常规日志目录（1.0-1 时代验证过 SpringBoard 可写这里）
+            NSString *dir = @"/var/mobile/Library/Logs/NoLockWallpaper";
+            [fm createDirectoryAtPath:dir withIntermediateDirectories:YES
+                            attributes:nil error:NULL];
+            [body writeToFile:[dir stringByAppendingPathComponent:@"diag.txt"]
+                   atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+
+            // 位置二：/tmp —— RootHide 可能重定向 /var/mobile/Library 下
+            //         的某些目录，写两份保证至少有一份能读到
+            [body writeToFile:@"/tmp/nlw_diag.txt"
+                   atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+        } @catch (NSException *e) { }
+    }
+}
+
+/// 追加一行诊断。线程安全 + 自动 debounce 落盘。
+static void NLWDiagAdd(NSString *line)
+{
+    @try {
+        if (!gDiagLock) {
+            @synchronized (NSFileManager.class) {   // 一次性初始化用，借用任意类对象做锁
+                if (!gDiagLock) {
+                    gDiagLines = [NSMutableArray new];
+                    gDiagSeen  = [NSMutableArray new];
+                    gDiagLock  = [NSObject new];
+                }
+            }
+        }
+        BOOL needSchedule = NO;
+        @synchronized (gDiagLock) {
+            if (gDiagLines.count >= 200) return;
+            [gDiagLines addObject:(line ?: @"?")];
+            if (!gDiagScheduled && gDiagFlushes < 20) {
+                gDiagScheduled = YES;
+                gDiagFlushes++;
+                needSchedule = YES;
+            }
+        }
+        if (needSchedule) {
+            // ★ 绝不在当前线程写盘：调用方是 SpringBoard 主线程，
+            //   主线程上做文件 IO 是 watchdog 杀进程的经典成因。
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                           dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+                NLWDiagFlushNow();
+            });
+        }
+    } @catch (NSException *e) { }
+}
+
+/// 记录一个手势的完整现场。tag 用于区分是在哪一层捕获到的
+/// （add = 添加时拦到；scan = 上屏/出现时补扫到）。
+static void NLWDiagNoteGesture(UIGestureRecognizer *g, UIView *host, const char *tag)
+{
+    if (!g) return;
+    @try {
+        BOOL isEdge = [g isKindOfClass:[UIScreenEdgePanGestureRecognizer class]];
+        if (!isEdge && !NLWIsPanish(g)) return;     // 只关心滑动类，其余早退
+
+        // 懒初始化（借任意类对象做一次性初始化锁，避免另起 pthread_once）
+        @synchronized ([NSFileManager class]) {
+            if (!gDiagLock) {
+                gDiagLines = [NSMutableArray new];
+                gDiagSeen  = [NSMutableArray new];
+                gDiagLock  = [NSObject new];
+            }
+        }
+
+        // 去重：同一个手势实例只记一次（scan 层会反复扫到同一批手势）
+        @synchronized (gDiagLock) {
+            NSValue *k = [NSValue valueWithPointer:(__bridge void *)g];
+            if ([gDiagSeen containsObject:k]) return;
+            if (gDiagSeen.count >= 400) return;
+            [gDiagSeen addObject:k];
+        }
+
+        const char *cn = class_getName(object_getClass(g));
+
+        NSString *edges = @"-";
+        if (isEdge) {
+            @try {
+                edges = [NSString stringWithFormat:@"%lu",
+                         (unsigned long)((UIScreenEdgePanGestureRecognizer *)g).edges];
+            } @catch (NSException *e) { }
+        }
+
+        // 宿主类名链（最多 10 层，够看出是不是锁屏 / 相机容器）
+        NSMutableArray *chain = [NSMutableArray array];
+        @try {
+            UIView *v = host;
+            int d = 0;
+            while (v && d++ < 10) {
+                NSString *n = NSStringFromClass([v class]);
+                [chain addObject:(n ? n : @"?")];
+                v = [v superview];
+            }
+        } @catch (NSException *e) { }
+
+        NSString *tagStr = (tag ? [NSString stringWithUTF8String:tag] : @"?");
+        // ★ 这里**故意不复算**相机判据。
+        //   一是避免多一处判据引用（源码闸门要求「两处主逻辑用同一判据」，
+        //   多一处会让计数失真）；二是没必要 —— 判据是否命中完全可以从
+        //   这里记录的原始事实（类名 / edges / sup）推出来，而原始事实
+        //   才是真正要拿到的数据。
+        NSString *line = [NSString stringWithFormat:
+            @"[%@] cls=%s edge=%d edges=%@ sup=%d gEn=%d camSw=%d\n"
+            @"     chain=%@",
+            (tagStr ? tagStr : @"?"),
+            (cn ? cn : "?"), (int)isEdge, edges,
+            (int)NLWIsSuppressibleLockScreenArea(host),
+            (int)gEnabled, (int)gBlockCameraSwipe,
+            [chain componentsJoinedByString:@" > "]];
+        NLWDiagAdd(line);
+    } @catch (NSException *e) { }
+}
+
+// ============================================================================
 //  五、压制动作（含「记住原状」以支持实时恢复）
 // ============================================================================
 
@@ -471,6 +632,12 @@ static NSUInteger NLWProcessView(UIView *v)
 
         for (UIGestureRecognizer *g in gs) {
             @try {
+                // ★ 诊断（1.3-1 临时）：这一层是「视图已上屏、补扫它身上
+                //   早已挂好的手势」。如果相机手势是在 hook 装上之前就添加的，
+                //   只有这里能拿到它 —— 所以必须在这里也记一笔，
+                //   否则「add 层没记录」这个现象会被误判成「hook 没装上」。
+                NLWDiagNoteGesture(g, v, "scan");
+
                 if (NLWIsLongPressish(g)) {
                     NLWSuppressGesture(g);
                     n++;
@@ -596,6 +763,11 @@ static void NLWAddGestureRecognizer(id self, SEL _cmd, UIGestureRecognizer *g)
 {
     BOOL hit = NO;
     @try {
+        // ★ 诊断（1.3-1 临时）：**放在开关判断之前**。
+        //   即使总开关关着也要记录 —— 否则「开关是不是没读对」这件事
+        //   也会变成盲区。记录本身有早退（非滑动类直接返回），开销可忽略。
+        NLWDiagNoteGesture(g, (UIView *)self, "add");
+
         // 三道便宜过滤：
         //   ① 总开关关着 → 不过问
         //   ② 不是「长按」也不是「相机滑动」→ 立刻放过（绝大多数调用走这条路）
@@ -624,6 +796,19 @@ static void NLWDidMoveToWindow(id self, SEL _cmd)
 {
     @try { NLWProcessView((UIView *)self); }
     @catch (NSException *e) { }
+
+    // ★ 诊断（1.3-1 临时）：锁屏类视图**自身**挂的手势也要记一笔。
+    //   NLWProcessView 只在「可压制区」判据成立时才去遍历手势；
+    //   如果相机手势的宿主恰好被那个判据挡住，就永远看不到它 ——
+    //   而那恰恰是本次要查的核心疑点。这里单独扫，绕过该判据。
+    @try {
+        UIView *v = (UIView *)self;
+        if (v && NLWIsLockScreenish(v)) {
+            for (UIGestureRecognizer *g in v.gestureRecognizers) {
+                NLWDiagNoteGesture(g, v, "ls");
+            }
+        }
+    } @catch (NSException *e) { }
 
     if (gOrigDidMove) ((void (*)(id, SEL))gOrigDidMove)(self, _cmd);
 }

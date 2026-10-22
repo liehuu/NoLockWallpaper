@@ -17,7 +17,12 @@ env:
   # ★ 1.2-1 首版 CI 绿了但下载产物后发现第二个缺陷：data.tar 里也打了
   #   ./DEBIAN/postinst（dpkg 会解到根目录 /DEBIAN）。rootless 上 / 只读
   #   → 整个包装不上。也在这一版修掉，所以 1.2-1 没有对外发过。
-  VERSION: 1.2-1
+  # ★ 1.3-1：**诊断版**。1.2-1 实机反馈「禁长按生效、禁左滑进相机没生效」。
+  #   长按能拦说明 dylib 已加载、hook 已装上 → 问题在判据没命中。
+  #   本版功能与 1.2-1 完全一致，只额外把真实手势现场（类名 / edges /
+  #   宿主类名链 / 可压制判定 / 两个开关状态）写到两个位置，用来定位。
+  #   定位完这块代码必须整块删除（Tweak.m 里标了「四点五、临时诊断」）。
+  VERSION: 1.3-1
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 
