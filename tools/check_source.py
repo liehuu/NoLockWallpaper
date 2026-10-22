@@ -453,6 +453,28 @@ for path in [BUILD, MKDEB, os.path.join(_REPO, "NoLockWallpaper.plist")]:
         "" if b"\r\n" not in raw else "含 CRLF，runner 上会报错")
 
 # =====================================================================
+print("\n[A16] 索引里的可执行位（644 在 runner 上 permission denied）")
+
+# ★ 真实事故（SingleVPN 项目反复出现）：
+#   git add -A 会把 755 降成 644；Windows 上 os.name == 'nt' 恒真导致
+#   REST 直推也走错分支。表现是 runner 上报 "permission denied"，
+#   或者 sh 脚本能被 sh 调用但 ./build.sh 不行。
+try:
+    import subprocess
+    out = subprocess.run(["git", "ls-files", "-s", "devkit/"],
+                         cwd=_REPO, capture_output=True, text=True).stdout
+    bad = []
+    for line in out.splitlines():
+        meta, path = line.split("\t", 1)
+        mode = meta.split()[0]
+        if path.endswith(".sh") and mode != "100755":
+            bad.append("%s=%s" % (path, mode))
+    chk("索引中所有 .sh 均为 100755", not bad,
+        "；".join(bad) + "（修法：git update-index --chmod=+x <file>）" if bad else "全部 100755")
+except Exception as e:
+    chk("索引中所有 .sh 均为 100755", False, "无法读取索引：%s" % e)
+
+# =====================================================================
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))
 if fails:
