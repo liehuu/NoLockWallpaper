@@ -17,7 +17,11 @@ import re
 import sys
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC = os.path.join(_REPO, "Tweak.m")
+
+# ★ 支持被反向验证脚本替换源码路径：verify_negative.py 会生成「故意写坏」
+#   的 Tweak.m 副本，通过这个环境变量指过来，避免污染工作区真实文件。
+#   不设该变量时行为与以前完全一致。
+SRC = os.environ.get("NLW_SRC_OVERRIDE") or os.path.join(_REPO, "Tweak.m")
 BUILD = os.path.join(_REPO, "devkit", "build.sh")
 MKDEB = os.path.join(_REPO, "devkit", "mkdeb.sh")
 PLIST = os.path.join(_REPO, "NoLockWallpaper.plist")
@@ -155,7 +159,11 @@ if m:
 # =====================================================================
 print("\n[A3] orig 转发前必须判非空（调 NULL 必崩）")
 
-for gorig in ["gOrigAddGesture", "gOrigDidMove", "gOrigViewDidAppear"]:
+# ★ 这一组只覆盖「单一静态 orig」的两个转发点。
+#   viewDidAppear: 的 orig 已改为「按类成对存」，转发点写法是
+#   IMP o = NLWOrigViewDidAppearFor(self); if (o && ...) o(...)
+#   由 A4c 单独覆盖 —— 不能硬塞进这个 regex，否则判据与实际写法不符。
+for gorig in ["gOrigAddGesture", "gOrigDidMove"]:
     # ★ 实际写法是 ((void (*)(id, SEL, id))gOrigXxx)(self, _cmd, ...)
     #   正则必须容忍 (*)( 里面带参数列表。
     #   第一版写成 \(\*\s*\) 只匹配空参数，结果"调用 0 处"——典型的假通过：
@@ -163,7 +171,6 @@ for gorig in ["gOrigAddGesture", "gOrigDidMove", "gOrigViewDidAppear"]:
     calls = re.findall(r"\(\s*\(\s*void\s*\(\s*\*\s*\)\s*\([^)]*\)\s*\)\s*%s\s*\)"
                        % gorig, code)
     guarded = re.findall(r"if\s*\(\s*%s\s*\)" % gorig, code)
-    named = re.findall(r"[^a-zA-Z_](%s)\s*\)\s*\(" % gorig, code)
 
     # ★ 必须真的找到调用点，否则"全判空"是假通过
     chk("%s 存在真实调用点（判据有效性自检）" % gorig,
@@ -176,10 +183,153 @@ for gorig in ["gOrigAddGesture", "gOrigDidMove", "gOrigViewDidAppear"]:
 # =====================================================================
 print("\n[A4] hook 安装必须区分「自己实现」与「继承」（否则污染父类）")
 
-chk("NLWInstallHook 比较 curImp 与 supImp", "curImp == supImp" in code,
-    "" if "curImp == supImp" in code else "未区分继承，会改到父类方法表")
+# ★ 判据要精确到「新实现的具体机制」，不能只查变量名。
+#   v1.2 起实现改成：先取本类真实 Method，再比对父类 Method 的 IMP
+#   是否与本类相同（相同 = 本类没覆盖 = 继承）。
+chk("NLWInstallHook 用 method_getImplementation 取真实 IMP",
+    "method_getImplementation(own)" in code,
+    "" if "method_getImplementation(own)" in code else "未取真实 IMP")
+chk("继承判定基于「本类 Method 与父类 Method 的 IMP 相同」",
+    "method_getImplementation(supMethod) == ownImp" in code,
+    "" if "method_getImplementation(supMethod) == ownImp" in code else "继承判定缺失")
 chk("继承时走 class_addMethod（不碰父类）", "class_addMethod" in code)
 chk("安装失败返回 NO（干净跳过）", re.search(r"return NO;", code) is not None)
+chk("类上没有该方法时直接放弃（不硬上）",
+    re.search(r"Method own = class_getInstanceMethod\(cls, sel\);\s*\n\s*if \(!own\) return NO;", code) is not None,
+    "" if re.search(r"if \(!own\) return NO;", code) else "缺「没有该方法就跳过」")
+
+# =====================================================================
+print("\n[A4b] 转发桩过滤（orig 是 objc_msgForward 时转发 = 必崩宿主）")
+
+# ★★★ 这是本轮新增的最高危防线：
+#   method_getImplementation 在「没人实现该 selector」的边界情形会给出
+#   objc_msgForward（非 NULL 转发桩）。把它当 orig 存下再调用，等于把消息
+#   再送一次转发 → arm64e 上 EXC_BAD_ACCESS 或无限递归 → SpringBoard 崩。
+chk("存在转发桩判定 NLWIsForwardingIMP", "NLWIsForwardingIMP" in code)
+chk("转发桩判定覆盖 imp 为 NULL",
+    re.search(r"static BOOL NLWIsForwardingIMP\(IMP imp\)\s*\{\s*\n\s*if \(!imp\) return YES;", code) is not None,
+    "" if re.search(r"NLWIsForwardingIMP\(IMP imp\)", code) else "函数签名不符")
+
+# 每一条「取 IMP 并写入 orig」的路径都必须先过转发桩过滤
+inst = re.search(r"static BOOL NLWInstallHook\(.*?\n\}", code, re.S)
+chk("NLWInstallHook 存在", inst is not None)
+if inst:
+    body = inst.group(0)
+    chk("NLWInstallHook 对 ownImp 做转发桩过滤", "NLWIsForwardingIMP(ownImp)" in body)
+    chk("NLWInstallHook 对回退路径的 cur 做转发桩过滤", "NLWIsForwardingIMP(cur)" in body,
+        "" if "NLWIsForwardingIMP(cur)" in body else "回退路径未过滤")
+    chk("NLWInstallHook 进入即把 origOut 置空（绝不残留脏值）",
+        re.search(r"if \(origOut\) \*origOut = NULL;", body) is not None)
+
+# 三条转发点必须都带判空（objc 消息里 orig 可能是 NULL）
+fwd_checks = len(re.findall(r"if \(gOrig\w+\)", code))
+chk("转发前判空 guard（>=2 处）", fwd_checks >= 2,
+    "实际 %d 处：gOrigAddGesture / gOrigDidMove" % fwd_checks)
+
+# =====================================================================
+print("\n[A4c] viewDidAppear orig 必须按类成对存（否则截断别人生命周期）")
+
+# ★ iOS 17 上 SBLockScreenViewController 与 CSCoverSheetViewController 可能
+#   同时存在。共用一个全局 orig → 第二个类的原始实现永远不被调用 →
+#   锁屏控制器自身逻辑被砍（黑屏/不刷新/卡死）。
+chk("存在按类存 orig 的容器（gCtlCls / gCtlOrig）",
+    "gCtlCls" in code and "gCtlOrig" in code)
+chk("存在按 self 类链查 orig 的函数 NLWOrigViewDidAppearFor",
+    "NLWOrigViewDidAppearFor" in code)
+chk("不再使用单一全局 gOrigViewDidAppear",
+    "gOrigViewDidAppear" not in code,
+    "" if "gOrigViewDidAppear" not in code else "共用 orig 会截断第二个类的生命周期回调")
+
+m = re.search(r"static IMP NLWOrigViewDidAppearFor\(id self\)\s*\{", code)
+if m:
+    start = m.end() - 1
+    depth, i = 0, start
+    while i < len(code):
+        if code[i] == "{":
+            depth += 1
+        elif code[i] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    body = code[start:i + 1]
+    chk("查 orig 时沿类链向上匹配", "class_getSuperclass(k)" in body,
+        "" if "class_getSuperclass(k)" in body else "只比对精确类，子类实例会拿不到 orig")
+
+# viewDidAppear 的转发点写法与另两个不同（orig 是按类查出来的局部变量 o），
+# 因此单独做「调用点 + 判空」自检，避免 A3 的 regex 覆盖不到而变成空跑。
+chk("NLWViewDidAppear 存在真实转发调用（判据有效性自检）",
+    re.search(r"\(\s*\(\s*void\s*\(\s*\*\s*\)\s*\([^)]*BOOL\s*\)\s*\)\s*o\s*\)\s*\(\s*self\s*,\s*_cmd\s*,\s*animated\s*\)",
+              code) is not None,
+    "" if re.search(r"\)\s*o\s*\)\s*\(\s*self\s*,\s*_cmd\s*,\s*animated", code)
+    else "找不到 viewDidAppear 的转发调用点")
+chk("NLWViewDidAppear 转发前判 o 非空",
+    re.search(r"if \(o && !NLWIsForwardingIMP\(o\)\)", code) is not None,
+    "" if re.search(r"if \(o && !NLWIsForwardingIMP\(o\)\)", code) else "转发前未判空")
+chk("转发 viewDidAppear 前再筛一次转发桩", "NLWIsForwardingIMP(o)" in code,
+    "" if "NLWIsForwardingIMP(o)" in code else "转发前未筛转发桩")
+
+# =====================================================================
+print("\n[A4d] 不得直接引用 arm64 上不存在的符号（会让 dylib 加载失败）")
+
+# ★★★ 本轮差点踩的坑：
+#   _objc_msgForward_stret 在 arm64 上已从 libobjc 移除。用
+#   -undefined dynamic_lookup 链接时编译期不报错，但运行期 dyld 找不到
+#   符号 → 整份 dylib 加载失败 → 表现是「完全没生效，日志一行都没有」。
+#   必须用 dlsym 在运行时取，取不到也只是这层保护不启用。
+chk("未在代码中直接写 &_objc_msgForward_stret",
+    re.search(r"(?<![A-Za-z0-9_\"])&_objc_msgForward_stret", code) is None,
+    "" if re.search(r"(?<![A-Za-z0-9_\"])&_objc_msgForward_stret", code) is None
+    else "arm64 无此符号，直接引用 = dylib 加载失败")
+chk("未在代码中直接写 &_objc_msgForward",
+    re.search(r"(?<![A-Za-z0-9_\"])&_objc_msgForward(?!_)", code) is None,
+    "" if re.search(r"(?<![A-Za-z0-9_\"])&_objc_msgForward(?!_)", code) is None
+    else "应改用 dlsym 取符号")
+# ★ 这两项必须查原始 src：strip_code 会把字符串字面量内容换成空格，
+#   拿 code 查 "_objc_msgForward" 这样的字符串必然查不到 —— 属于本项目
+#   已经踩过的「检查器自己判错」。判据里出现字符串就必须用 src。
+chk("用 dlsym 取转发桩符号",
+    'dlsym(RTLD_DEFAULT, "_objc_msgForward")' in src,
+    "" if 'dlsym(RTLD_DEFAULT, "_objc_msgForward")' in src else "缺 dlsym 取符号")
+chk("dlsym 结果存静态变量（不每次调用都查符号表）",
+    re.search(r"static void \*fwd\s*=\s*NULL", src) is not None,
+    "" if re.search(r"static void \*fwd\s*=\s*NULL", src) else "每次 dlsym 有性能开销")
+
+# =====================================================================
+print("\n[A4e] 长按判据（含类名兜底）")
+
+chk("存在长按判据 NLWIsLongPressish", "NLWIsLongPressish" in code)
+chk("长按判据含 isKindOfClass 快路径",
+    "isKindOfClass:[UILongPressGestureRecognizer class]" in code)
+# ★ 同样必须查 src：'strstr(n, "LongPress")' 里的 needle 是字符串字面量
+chk("长按判据含类名 LongPress 兜底", 'strstr(n, "LongPress")' in src,
+    "" if 'strstr(n, "LongPress")' in src else "缺类名兜底")
+chk("压制循环使用统一判据（不再裸 isKindOfClass）",
+    re.search(r"if \(NLWIsLongPressish\(g\)\)", code) is not None,
+    "" if re.search(r"if \(NLWIsLongPressish\(g\)\)", code) else "循环判据与函数不一致")
+
+# =====================================================================
+print("\n[A4f] 热路径零分配（didMoveToWindow 是上屏热路径）")
+
+m = re.search(r"static NSUInteger NLWProcessView\(", code)
+chk("NLWProcessView 存在", m is not None)
+if m:
+    start = m.end() - 1
+    depth, i = 0, start
+    while i < len(code):
+        if code[i] == "{":
+            depth += 1
+        elif code[i] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    body = code[start:i + 1]
+    i_judge = body.find("NLWIsSuppressibleLockScreenArea(v)")
+    i_alloc = body.find("gestureRecognizers")
+    chk("判据在取 gestureRecognizers 之前（避免无谓数组分配）",
+        i_judge != -1 and i_alloc != -1 and i_judge < i_alloc,
+        "判据@%d 取数组@%d" % (i_judge, i_alloc))
 
 # =====================================================================
 print("\n[A5] 绝不下钻子视图（误伤通知/手电筒 long press）")

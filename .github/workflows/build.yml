@@ -48,6 +48,17 @@ jobs:
           set -e
           python3 tools/check_source.py
 
+      # ★ 反向验证：证明上面那些检查项「真的在跑」。
+      #   本项目已经踩过三次「闸门自己坏掉还报绿」的坑：
+      #     · 正则只匹配空参数表 → 报「调用 0 处」却 OK
+      #     · 子串判断假通过（ldid_DISABLED 含 ldid）
+      #     · 盲扫 tar 把二进制里的 0x78 当成 PAX 头
+      #   只有「注入违规 → 检查项必须非 0」才能证明判据有效。
+      - name: Verify checks actually fire (negative test)
+        run: |
+          set -e
+          python3 tools/verify_negative.py
+
   # ---------------------------------------------------------------------
   # 构建：**不安装 Theos**。
   #
