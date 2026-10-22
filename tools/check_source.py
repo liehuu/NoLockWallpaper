@@ -1036,6 +1036,29 @@ chk("设置页产物也过架构闸门",
     "" if re.search(r'lipo -info\s+"\$PREF_OUT', bd_code) is not None
     else "设置页架构不对不会被发现（主 dylib 的闸门查不到它）")
 
+# ★★ 设置页指纹**不能**含配置域名 —— 否则闸门必然误报。
+#   真实翻车（本轮 CI run 39713919672）：
+#     设置页的开关读写全交给 PSSwitchCell（走 Root.plist 的 defaults + key），
+#     控制器代码从来不碰 com.liehuu.nolockwallpaper。早先版本为了"看起来严谨"
+#     声明了一个 kNLWDomain 常量但从未使用（-Wunused-const-variable），
+#     删掉之后 —— 指纹闸门开始报「设置页缺 com.liehuu.nolockwallpaper」并 exit 1。
+#     这就是「改了实现没同步改判据」：查的是一个已经不存在的东西。
+#   域名正确的归属：主 dylib（读开关）+ Resources/Root.plist（写开关），
+#   两者对齐由 A7b 校验。设置页只要类名/载入/ivar 存取/重启能力。
+_pref_fp = ""
+for _m in re.finditer(r"for sym in (.*?);\s*do(.*?)done", bd_code, re.S):
+    if "PREF_OUT" in _m.group(2):
+        _pref_fp = _m.group(1)
+chk("能解析出设置页指纹列表", bool(_pref_fp),
+    "" if _pref_fp else "解析失败则下列两条判据无效")
+chk("设置页指纹不含配置域名（设置页不碰 CFPreferences）",
+    "com.liehuu.nolockwallpaper" not in _pref_fp.split(),
+    "" if "com.liehuu.nolockwallpaper" not in _pref_fp.split()
+    else "设置页产物里没有这个字符串 → 闸门必然误报 exit 1（本轮 CI 真实翻车）")
+chk("设置页指纹含 object_getIvar（证明走的是 runtime 存取而非裸指针）",
+    "object_getIvar" in _pref_fp.split(),
+    "实际：%s" % _pref_fp.split())
+
 # =====================================================================
 print("\n[A13c] 异常处理段名必须是真的（__objc_exception 不存在）")
 

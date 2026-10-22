@@ -241,6 +241,22 @@ BUILD_CASES = [
         "设置页产物也过架构闸门",
     ),
     (
+        # ★ 本轮 CI 真实翻车原样复现（run 39713919672）：
+        #   设置页代码压根不碰配置域名，闸门却要求产物里有 → 必然 exit 1。
+        "设置页指纹误加配置域名（闸门必然误报，CI 直接失败）",
+        "for sym in NoLockWallpaperRootListController loadSpecifiersFromPlistName \\\n"
+        "           object_getIvar SpringBoard; do",
+        "for sym in NoLockWallpaperRootListController com.liehuu.nolockwallpaper \\\n"
+        "           object_getIvar SpringBoard; do",
+        "设置页指纹不含配置域名",
+    ),
+    (
+        "设置页指纹漏掉 object_getIvar（退回裸指针存取也不会被发现）",
+        "           object_getIvar SpringBoard; do",
+        "           SpringBoard; do",
+        "设置页指纹含 object_getIvar",
+    ),
+    (
         "退回不存在的段名 __objc_exception（判据永远不生效）",
         'grep -q \'__gcc_except_tab\'',
         'grep -q \'__objc_exception\'',
