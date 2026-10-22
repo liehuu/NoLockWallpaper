@@ -222,14 +222,14 @@ CASES = [
         # → 相机手势宿主在 _UISystemGestureWindow，天然不满足该判据
         # → 依然不生效，而且源码看起来更「整齐」
         "description 命中后仍要求过区域判据（相机手势重新失效）",
-        "hit = camByDesc ? YES : NLWIsSuppressibleLockScreenArea((UIView *)self);",
+        "hit = (camByDesc || camBySwipe) ? YES",
         "hit = NLWIsSuppressibleLockScreenArea((UIView *)self);",
         "description 命中时绕过锁屏区域判据",
     ),
     (
         "压制循环里把 camByDesc 也门在 areaOK 后面（等于没有这条旁路）",
-        "if (camByDesc ||\n",
-        "if ((areaOK && camByDesc) ||\n",
+        "if (camByDesc || camBySwipe ||\n",
+        "if ((areaOK && camByDesc) || camBySwipe ||\n",
         "压制循环里 description 命中也绕过区域判据",
     ),
     (
@@ -243,9 +243,63 @@ CASES = [
     (
         # 功能上等价，但热路径回退：每个视图都要取一次 gestureRecognizers
         "系统手势窗口放行时放弃热路径优化（启动期白分配几百次）",
-        "if (!areaOK && !NLWIsSystemGestureHost(v)) return 0;",
-        "if (!areaOK) return 0;",
+        "if (!areaOK && !NLWIsSystemGestureHost(v) && !NLWIsLockScreenWindowHost(v)) {",
+        "if (!areaOK) {",
         "系统手势窗口放行但不放弃热路径优化",
+    ),
+    (
+        # 少了锁屏主窗口这一路 → 「相机手势挂在锁屏视图树上」那种情况覆盖不到
+        "入口只认系统手势窗口（锁屏窗口上的相机手势扫不到）",
+        "!NLWIsSystemGestureHost(v) && !NLWIsLockScreenWindowHost(v)",
+        "!NLWIsSystemGestureHost(v)",
+        "系统手势窗口放行但不放弃热路径优化",
+    ),
+    # ---- 1.5-1 新增：swipe 类判据的六条回归 ----
+    #
+    # 背景：1.4-1 的日志 108 条全是 Pan 类，edges 里没有 8 ——
+    # 相机手势不是 pan 类，被类型过滤连续挡了两道。
+    # 以下六条锁的是「不要再退回只认 pan 类 / 不要放宽到误伤通知」。
+    (
+        # 类名兜底不排除 pan 类 → _UISwipeActionPanGestureRecognizer 被当成
+        # 相机手势压掉 → 锁屏通知再也删不掉
+        "swipe 判据不排除 pan 类（左滑删除通知被废掉）",
+        "        if (NLWIsPanish(g)) return NO;\n",
+        "",
+        "swipe 判据先排除 pan 类",
+    ),
+    (
+        # 方向写错：左滑变右滑 → 相机不受影响，反而废掉右滑呼出通知中心
+        "swipe 判据方向写成右滑（相机没压到，反废通知中心）",
+        "UISwipeGestureRecognizerDirectionLeft",
+        "UISwipeGestureRecognizerDirectionRight",
+        "swipe 判据读 direction 且只认左滑",
+    ),
+    (
+        # 只在 add 层接入、压制循环没接 → 已挂好的手势扫不到
+        "压制循环没接 swipe 判据（已存在的手势扫不到）",
+        "                BOOL camBySwipe = (gBlockCameraSwipe && NLWIsCameraSwipeBySwipe(g));",
+        "                BOOL camBySwipe = NO;",
+        "两条压制路径都接入了 swipe 判据",
+    ),
+    (
+        # add 层不判作用域 → 主屏/App 内所有左滑被一起压
+        "add 层不给 swipe 判据加作用域（主屏左滑被误伤）",
+        "                camBySwipe = (NLWIsSystemGestureHost((UIView *)self) ||",
+        "                camBySwipe = (YES ||",
+        "swipe 判据在 add 层仍受作用域约束",
+    ),
+    (
+        # ★ 本轮最要紧的一条：诊断自己制造盲区
+        "诊断退回只记滑动类（非 pan 的相机手势永远查不到）",
+        "if (!isEdge && !isPan && !sysHost && !sup) return;",
+        "if (!isEdge && !isPan) return;",
+        "诊断不再只记录 pan 类",
+    ),
+    (
+        "诊断的 desc 恢复成只对 pan 类记录（盲区失明）",
+        "            NSString *d = [g description];",
+        "            if (NLWIsPanish(g)) {\n            NSString *d = [g description];",
+        "诊断的 desc 不再限定 pan 类",
     ),
 ]
 

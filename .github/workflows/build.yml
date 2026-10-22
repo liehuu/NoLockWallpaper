@@ -30,7 +30,14 @@ env:
   #   本版换数据源：读手势自己的 description（含 target 类名与 action 名），
   #   出现 camera 即压制，并绕开区域判据（理由见 Tweak.m「四之二」）。
   #   诊断段保留一轮，万一下一轮还要定位；确认修好后再整块删除。
-  VERSION: 1.4-1
+  # ★ 1.5-1：**第二次修复**。1.4-1 装后用户回传日志，得到第二个硬结论：
+  #   108 条记录、13 个手势类**全部是 Pan 类**，edges 只有 1/4/15，
+  #   8（右边缘）一次都没出现，而相机功能确实生效。
+  #   → 相机手势不是 pan 类，被诊断和判据的 `NLWIsPanish` 连续挡了两道。
+  #   本版：① 新增 swipe 左滑判据；② 诊断放宽到「系统手势窗口/锁屏窗口上
+  #   的任何手势类型」（并记 desc/dir），彻底消掉类型盲区。
+  #   同时新增 NLWIsLockScreenWindowHost，覆盖「相机挂在锁屏视图树上」这条。
+  VERSION: 1.5-1
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 

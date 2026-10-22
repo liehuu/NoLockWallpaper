@@ -789,25 +789,100 @@ chk("两条压制路径都查了 description 判据", _desc_refs >= 3,
     "引用 %d 次（定义 1 + 调用 2 = 3）" % _desc_refs)
 
 chk("description 命中时绕过锁屏区域判据",
-    # ★ 正形态：camByDesc ? YES : NLWIsSuppressibleLockScreenArea(...)
+    # ★ 正形态：(camByDesc || camBySwipe) ? YES : NLWIsSuppressibleLockScreenArea(...)
     #   这一句就是「宿主不在锁屏视图树里也能压」的唯一通道。
-    re.search(r"camByDesc\s*\?\s*YES\s*:\s*NLWIsSuppressibleLockScreenArea", code)
-    is not None,
-    "" if re.search(r"camByDesc\s*\?\s*YES\s*:", code) else
+    #   1.5-1 起判据扩到两个变量（swipe 那条也走同一个旁路口），
+    #   所以正则里两者都要出现 —— 只有 camByDesc 会被判成「swipe 没接上」。
+    re.search(r"\(\s*camByDesc\s*\|\|\s*camBySwipe\s*\)\s*\?\s*YES\s*:\s*"
+              r"NLWIsSuppressibleLockScreenArea", code) is not None,
+    "" if re.search(r"camByDesc\s*\|\|\s*camBySwipe\s*\)\s*\?\s*YES", code) else
     "改回「先过区域判据」→ 相机手势重新失效（它宿主天然不满足该判据）")
 
 chk("压制循环里 description 命中也绕过区域判据",
-    re.search(r"if\s*\(\s*camByDesc\s*\|\|", code) is not None,
-    "" if re.search(r"if\s*\(\s*camByDesc\s*\|\|", code) else
+    re.search(r"if\s*\(\s*camByDesc\s*\|\|\s*camBySwipe\s*\|\|", code) is not None,
+    "" if re.search(r"if\s*\(\s*camByDesc\s*\|\|\s*camBySwipe", code) else
     "循环里若写成 areaOK && camByDesc，等于没有这条旁路")
 
+# =====================================================================
+print("\n[A4h] 1.5-1：swipe 类判据（上一版连看都没看见的那一类）")
+# ★★ 为什么这一组必须存在：
+#   1.4-1 的实机日志 108 条、13 个手势类**全是 Pan 类**，edges 只有 1/4/15，
+#   8（右边缘）一次都没出现 —— 而相机功能确实生效。
+#   唯一自洽的解释是：相机手势不是 pan 类，被类型过滤连续挡了两道。
+#   1.5-1 因此新增 swipe 判据，并放宽诊断的类型过滤。
+#   这一组判据锁的是「不要再退回只认 pan 类」。
+
+chk("有 swipe 类判据 NLWIsCameraSwipeBySwipe",
+    "static BOOL NLWIsCameraSwipeBySwipe(UIGestureRecognizer *g)" in code)
+
+chk("swipe 判据读 direction 且只认左滑",
+    # ★ 只压左滑：上滑解锁、下滑通知、右滑通知中心都不能动。
+    re.search(r"UISwipeGestureRecognizerDirectionLeft", code) is not None,
+    "" if "UISwipeGestureRecognizerDirectionLeft" in code else
+    "不限定方向 → 会顺手废掉右滑呼出通知中心")
+
+chk("swipe 判据先排除 pan 类（防左滑删除通知被误伤）",
+    # ★ _UISwipeActionPanGestureRecognizer 名字里有 Swipe，
+    #   实际是 UIPanGestureRecognizer 的子类，通知左滑删除用的就是它。
+    #   类名兜底前不排除 pan 类 = 锁屏通知再也删不掉。
+    #
+    # ★ 第二个条件必须查原始 src：`"Swipe"` 是字符串字面量，
+    #   strip_code 会把引号里的内容换成空格 → 查 code 必然假红。
+    #   （这是本项目反复踩过的坑，见 A4g 附近同类注释。）
+    re.search(r"if\s*\(\s*NLWIsPanish\(g\)\s*\)\s*return\s+NO;", code) is not None
+    and re.search(r'strstr\(n,\s*"Swipe"\)', src) is not None,
+    "" if re.search(r"if\s*\(\s*NLWIsPanish\(g\)\s*\)\s*return\s+NO;", code) else
+    "类名兜底没排除 pan 类 → 左滑删除通知被废掉")
+
+chk("两条压制路径都接入了 swipe 判据",
+    # 定义 1 + ProcessView 1 + addGestureRecognizer 1 = 3
+    len(re.findall(r"NLWIsCameraSwipeBySwipe\s*\(", code)) >= 3,
+    "引用 %d 次（定义 1 + 调用 2 = 3）" %
+    len(re.findall(r"NLWIsCameraSwipeBySwipe\s*\(", code)))
+
+chk("swipe 判据在 add 层仍受作用域约束",
+    # ★ 与 camByDesc 不同：camera 三个字母只可能指向相机，
+    #   而 swipe 在主屏/App 内到处都是，必须在 add 层先过作用域判据。
+    re.search(r"camBySwipe\s*=\s*\(NLWIsSystemGestureHost\(\(UIView \*\)self\)\s*\|\|",
+              code) is not None,
+    "" if "NLWIsSystemGestureHost((UIView *)self)" in code else
+    "add 层不判作用域 → 主屏/App 内的左滑会被一起压")
+
+chk("有「锁屏主窗口宿主」判据",
+    "static BOOL NLWIsLockScreenWindowHost(UIView *v)" in code,
+    "" if "static BOOL NLWIsLockScreenWindowHost(UIView *v)" in code else
+    "缺它就覆盖不到「相机手势挂在锁屏窗口视图树上」这种情况")
+
+chk("诊断不再只记录 pan 类（否则永远看不见相机手势）",
+    # ★ 这是本轮最要紧的一条：上一版的早退条件
+    #   `if (!isEdge && !NLWIsPanish(g)) return;` 直接把非 pan 类丢掉了，
+    #   而相机手势恰恰就是非 pan 类 —— 诊断自己制造了盲区。
+    re.search(r"if\s*\(!isEdge\s*&&\s*!isPan\s*&&\s*!sysHost\s*&&\s*!sup\)\s*return;",
+              code) is not None,
+    "" if "!isEdge && !isPan && !sysHost && !sup" in code else
+    "诊断仍只记滑动类 → 非 pan 的相机手势永远查不到")
+
+chk("诊断记录 swipe 的方向值",
+    re.search(r"\(UISwipeGestureRecognizer \*\)g\)\.direction", code) is not None,
+    "" if "UISwipeGestureRecognizer *)g).direction" in code else
+    "不记 direction 就无法区分左滑/右滑")
+
+chk("诊断的 desc 不再限定 pan 类",
+    # ★ 1.4-1 把 desc 包在 `if (NLWIsPanish(g))` 里，
+    #   结果最可疑的非 pan 类连 description 都没有 —— 等于对盲区失明。
+    re.search(r"if\s*\(NLWIsPanish\(g\)\)\s*\{\s*\n\s*NSString \*d = \[g description\]",
+              code) is None,
+    "" if re.search(r"if\s*\(NLWIsPanish\(g\)\)\s*\{\s*\n\s*NSString \*d = \[g description\]",
+                    code) is None else
+    "desc 仍只对 pan 类记录 → 非 pan 手势看不到 target 是谁")
+
 chk("系统手势窗口放行但不放弃热路径优化",
-    # ★ 正形态：if (!areaOK && !NLWIsSystemGestureHost(v)) return 0;
-    #   少了后半句 = 每个视图都要取 gestureRecognizers，
+    # ★ 正形态：if (!areaOK && !sysHost(v) && !lockScreenWindowHost(v)) return 0;
+    #   少了后两个条件 = 每个视图都要取 gestureRecognizers，
     #   didMoveToWindow 是启动期热路径，等于白分配几百次。
-    re.search(r"!\s*areaOK\s*&&\s*!\s*NLWIsSystemGestureHost\(v\)\s*\)\s*return\s+0", code)
-    is not None,
-    "" if "NLWIsSystemGestureHost(v)) return 0" in code else
+    re.search(r"!\s*areaOK\s*&&\s*!\s*NLWIsSystemGestureHost\(v\)\s*&&\s*"
+              r"!\s*NLWIsLockScreenWindowHost\(v\)", code) is not None,
+    "" if "NLWIsLockScreenWindowHost(v)) {" in code else
     "每个视图都取手势数组 = 启动期白分配几百次")
 
 chk("长按仍严格限定在锁屏区域（不被新旁路带偏）",

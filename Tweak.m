@@ -412,6 +412,98 @@ static BOOL NLWIsCameraGestureByDescription(UIGestureRecognizer *g)
 }
 
 // ============================================================================
+//  四之三、1.5-1 新增：swipe 类 —— 上一版连看都没看见的那一类
+// ============================================================================
+//
+// ★★ 为什么会有这一节（1.4-1 日志给出的第二个硬证据，2026-10-22）：
+//   1.4-1 的日志有 108 条记录、13 个手势类，统计下来**全部是 Pan 类**：
+//     UIScrollViewPanGestureRecognizer(54) / UIPanGestureRecognizer(26)
+//     SBHomeGesturePanGestureRecognizer(6) / _UISwipeActionPanGestureRecognizer(5)
+//     _UIMultiSelectOneFingerPanGesture(5) / SBFluidSwitcherPanGestureRecognizer(3)
+//     SBScreenEdgePanGestureRecognizer(2) / SBCoverSheetScreenEdgePanGestureRecognizer(2)
+//     _UIKBProductivityPanGestureRecognizer(1) / UIScreenEdgePanGestureRecognizer(1)
+//     SBFluidSwitcherScreenEdgePanGestureRecognizer(1)
+//     SBCoverSheetPresentationGestureRecognizer(1) / CCUIDismissalGestureRecognizer(1)
+//   而 edges 的取值只有 1 / 4 / 15，**8（右边缘）一次都没出现过**。
+//
+//   一边是「相机功能确实生效」，一边是「108 条里一个相机都没有」——
+//   唯一自洽的解释：**相机手势根本不是 pan 类**，
+//   它被诊断代码的 `if (!isEdge && !NLWIsPanish(g)) return;` 挡在门外，
+//   同时被判据层的 `NLWIsPanish` 挡在门外 —— 连续两道，全都没看见它。
+//
+//   ★ 通用规律（本轮第二次踩到同一类坑）：
+//     **一道「类型过滤」如果写在诊断入口，它同时也会成为盲区制造者。**
+//     诊断代码的过滤条件越"省事"，排查时丢掉的假设就越多。
+//     真正该做的是：**把过滤条件放宽到"凡是可疑区域上的都留"**。
+//
+// ★ 为什么「只压左滑」而不是「压所有 swipe」：
+//   锁屏空白处的四个方向各自的含义是固定的：
+//     上滑 = 解锁        （SBHomeGesturePanGestureRecognizer，pan 类，不受影响）
+//     下滑 = 通知列表    （SBCoverSheetPresentationGestureRecognizer，top 边缘）
+//     右滑 = 通知中心    （direction = Right）
+//     左滑 = 相机        （direction = Left）← 只有这个要压
+//   压所有 swipe 会顺手带走右滑呼出通知中心，属于不必要的误伤。
+//
+// ★ 为什么这条判据不会误伤「左滑删除通知」：
+//   通知的左滑删除用的是 `_UISwipeActionPanGestureRecognizer`，
+//   它是 UIPanGestureRecognizer 的子类（名字里虽然有 Swipe）。
+//   所以下面第一件事就是 `if (NLWIsPanish(g)) return NO;` 把它排除掉。
+//   这类「名字像但继承关系不同」的手势，只按类名匹配必然误伤。
+
+/// 宿主是否位于「锁屏主窗口」的视图树里。
+///
+/// ★ 为什么要单独认这一层（1.5-1）：
+///   相机手势的宿主有两种可能，两条都要覆盖：
+///     ① 系统全局手势窗口（`_UISystemGestureWindow`）—— 由
+///        NLWIsSystemGestureHost 负责；
+///     ② 锁屏主窗口（`SBCoverSheetWindow` / `SBLockScreenWindow`）——
+///        由本函数负责。
+///   而 ② 这一路往往过不了 `NLWIsSuppressibleLockScreenArea`：
+///   那个判据会排除「向上路径经过 UIScrollView」和「自己是 UIControl」的视图，
+///   相机入口很可能正好落在这两类里。
+///   → 所以给 swipe 判据单独开这一个作用域，**但不放宽长按判据**。
+///
+/// ★ 为什么放宽到整个锁屏窗口对 swipe 是安全的：
+///   本函数只被 `NLWIsCameraSwipeBySwipe` 使用，而那条判据第一件事就是
+///   排除 pan 类 —— 通知的左滑删除（`_UISwipeActionPanGestureRecognizer`）
+///   恰好是 pan 子类，进不来。锁屏窗口内其余的 swipe 只有相机。
+static BOOL NLWIsLockScreenWindowHost(UIView *v)
+{
+    if (!v) return NO;
+    @try {
+        UIWindow *w = v.window;
+        if (!w) return NO;
+        if (NLWChainHas(w, "CoverSheet")) return YES;
+        if (NLWChainHas(w, "LockScreen")) return YES;
+    } @catch (NSException *e) { }
+    return NO;
+}
+
+/// 是否是「左滑」类手势（锁屏相机入口的候选实现）。
+static BOOL NLWIsCameraSwipeBySwipe(UIGestureRecognizer *g)
+{
+    if (!g) return NO;
+    @try {
+        // ① 标准 swipe：读 direction（公开属性）
+        if ([g isKindOfClass:[UISwipeGestureRecognizer class]]) {
+            UISwipeGestureRecognizerDirection d =
+                ((UISwipeGestureRecognizer *)g).direction;
+            return (d & UISwipeGestureRecognizerDirectionLeft) != 0;
+        }
+
+        // ② 类名兜底 —— 但**必须先排除 pan 类**。
+        //   `_UISwipeActionPanGestureRecognizer` 名字里有 Swipe，
+        //   实际是 UIPanGestureRecognizer 的子类（通知左滑删除用它）。
+        //   不排除就会把「左滑删除通知」一起废掉 —— 这是真实存在的误伤路径。
+        if (NLWIsPanish(g)) return NO;
+
+        const char *n = class_getName(object_getClass(g));
+        if (n && strstr(n, "Swipe")) return YES;
+    } @catch (NSException *e) { }
+    return NO;
+}
+
+// ============================================================================
 //  四点五、临时诊断（1.3-1 专用；定位完必须整块删除）
 // ============================================================================
 //
@@ -524,7 +616,21 @@ static void NLWDiagNoteGesture(UIGestureRecognizer *g, UIView *host, const char 
     if (!g) return;
     @try {
         BOOL isEdge = [g isKindOfClass:[UIScreenEdgePanGestureRecognizer class]];
-        if (!isEdge && !NLWIsPanish(g)) return;     // 只关心滑动类，其余早退
+        BOOL isPan  = NLWIsPanish(g);
+
+        // ★★ 1.5-1：诊断范围从「滑动类」放宽到
+        //   「滑动类 + 系统手势窗口/锁屏区域上的**任何**手势」。
+        //
+        //   为什么必须放宽（1.4-1 日志给出的硬证据，2026-10-22）：
+        //   108 条记录、13 个手势类，**全部是 Pan 类**，
+        //   而 `camera` 字样一个都没有 —— 可用户确实能通过
+        //   「锁屏右边缘左滑」进相机。
+        //   两者同时成立，只剩一个解释：**那个手势不是 pan 类**，
+        //   被下面这条早退直接丢掉了，从 add 层到判据层连续两道都没看见它。
+        //   所以本轮正是要查「非 pan 类里有没有相机手势」。
+        BOOL sysHost = NLWIsSystemGestureHost(host);
+        BOOL sup     = NLWIsSuppressibleLockScreenArea(host);
+        if (!isEdge && !isPan && !sysHost && !sup) return;
 
         // 懒初始化（借任意类对象做一次性初始化锁，避免另起 pthread_once）
         @synchronized ([NSFileManager class]) {
@@ -553,6 +659,17 @@ static void NLWDiagNoteGesture(UIGestureRecognizer *g, UIView *host, const char 
             } @catch (NSException *e) { }
         }
 
+        // ★ 1.5-1 新增：swipe 的方向值。
+        //   UISwipeGestureRecognizer 没有 edges 属性，方向只在 direction 里。
+        //   1=右 2=左 4=上 8=下（可以相加）。
+        NSString *dir = @"-";
+        @try {
+            if ([g isKindOfClass:[UISwipeGestureRecognizer class]]) {
+                dir = [NSString stringWithFormat:@"%lu",
+                       (unsigned long)((UISwipeGestureRecognizer *)g).direction];
+            }
+        } @catch (NSException *e) { }
+
         // 宿主类名链（最多 10 层，够看出是不是锁屏 / 相机容器）
         NSMutableArray *chain = [NSMutableArray array];
         @try {
@@ -574,27 +691,30 @@ static void NLWDiagNoteGesture(UIGestureRecognizer *g, UIView *host, const char 
         // ★ 1.4-1 新增：把手势自己的 description 也记下来。
         //   这是本轮唯一能回答「这个手势到底是谁的」的数据源 ——
         //   它内部带 target 的 action 名与 target 类名。
+        //
+        // ★ 1.5-1 修正：**去掉「只对 pan 类记」的限制**。
+        //   上一版就是因为这个限制，让「本来就是非 pan 类的相机手势」
+        //   连 desc 都没有，等于对最可疑的那一类完全失明。
+        //   现在凡是能走到这里的（含 sysHost/锁屏上的任意手势）都记。
         NSString *desc = @"-";
         @try {
-            if (NLWIsPanish(g)) {
-                NSString *d = [g description];
-                if ([d isKindOfClass:[NSString class]] && d.length) {
-                    if (d.length > 320) d = [d substringToIndex:320];
-                    // 压成一行，避免破坏「一行一条记录」的解析
-                    desc = [d stringByReplacingOccurrencesOfString:@"\n"
-                                                        withString:@" "];
-                }
+            NSString *d = [g description];
+            if ([d isKindOfClass:[NSString class]] && d.length) {
+                if (d.length > 480) d = [d substringToIndex:480];
+                // 压成一行，避免破坏「一行一条记录」的解析
+                desc = [d stringByReplacingOccurrencesOfString:@"\n"
+                                                    withString:@" "];
             }
         } @catch (NSException *e) { }
 
         NSString *line = [NSString stringWithFormat:
-            @"[%@] cls=%s edge=%d edges=%@ sup=%d sysHost=%d gEn=%d camSw=%d\n"
+            @"[%@] cls=%s edge=%d edges=%@ dir=%@ sup=%d sysHost=%d\n"
+            @"     gEn=%d camSw=%d\n"
             @"     desc=%@\n"
             @"     chain=%@",
             (tagStr ? tagStr : @"?"),
-            (cn ? cn : "?"), (int)isEdge, edges,
-            (int)NLWIsSuppressibleLockScreenArea(host),
-            (int)NLWIsSystemGestureHost(host),
+            (cn ? cn : "?"), (int)isEdge, edges, (dir ? dir : @"-"),
+            (int)sup, (int)sysHost,
             (int)gEnabled, (int)gBlockCameraSwipe,
             (desc ? desc : @"-"),
             [chain componentsJoinedByString:@" > "]];
@@ -767,7 +887,15 @@ static NSUInteger NLWProcessView(UIView *v)
         //   这一路是被视图结构绕过的，不是判据写错。
         //   所以：不在可压制区时，只对「系统手势窗口里的宿主」继续往下走，
         //   其余视图依然在这里就返回，热路径开销与改动前完全一致。
-        if (!areaOK && !NLWIsSystemGestureHost(v)) return 0;
+        //
+        // ★ 1.5-1：再加一个放行口 —— 锁屏主窗口里的宿主。
+        //   理由：相机手势也可能不挂在系统手势窗口，而是挂在锁屏窗口的
+        //   某个视图上；而那个视图往往过不了区域判据（可能是 UIControl，
+        //   或向上路径经过滚动容器）。不过放行进来的视图里，
+        //   **只有 swipe 判据会生效**（长按仍要 areaOK），不会扩大误伤面。
+        if (!areaOK && !NLWIsSystemGestureHost(v) && !NLWIsLockScreenWindowHost(v)) {
+            return 0;
+        }
 
         NSArray *gs = v.gestureRecognizers;
         if (gs.count == 0) return 0;
@@ -793,7 +921,14 @@ static NSUInteger NLWProcessView(UIView *v)
                 //   这一条不看宿主位置，因为宿主位置这条路已被证明走不通。
                 BOOL camByDesc = (gBlockCameraSwipe &&
                                   NLWIsCameraGestureByDescription(g));
-                if (camByDesc ||
+                // ★ 1.5-1：swipe 类左滑。它既不是 pan 类、也没有 edges，
+                //   所以必须单独成一条。
+                //   ★ 作用域不用再判一次：能走到这个循环的手势，宿主必然已满足
+                //     `areaOK || NLWIsSystemGestureHost(v) || NLWIsLockScreenWindowHost(v)`
+                //     （入口那句 return 0 把它们之外的视图全挡掉了）。
+                //     在这里重复判断只会多花一次类名遍历，属于纯浪费。
+                BOOL camBySwipe = (gBlockCameraSwipe && NLWIsCameraSwipeBySwipe(g));
+                if (camByDesc || camBySwipe ||
                     (areaOK && gBlockCameraSwipe && NLWIsCameraSwipeish(g, v))) {
                     NLWSuppressGesture(g);
                     n++;
@@ -931,13 +1066,26 @@ static void NLWAddGestureRecognizer(id self, SEL _cmd, UIGestureRecognizer *g)
         //   它是唯一能绕过「锁屏视图树」判据的口子，理由见
         //   「四之二」小节 —— 相机手势的宿主根本不在锁屏视图树里。
         //   注意：camByDesc 命中时 hit 直接为 YES，不再要求区域判据。
-        BOOL camByDesc = NO;
+        //
+        // ★ 1.5-1：新增 camBySwipe（swipe 类左滑）。与 camByDesc 不同，
+        //   它**必须**先过作用域判据 —— swipe 在主屏、App 内到处都是，
+        //   不像 camera 那三个字母只可能指向相机。
+        BOOL camByDesc  = NO;
+        BOOL camBySwipe = NO;
         if (gEnabled && gBlockCameraSwipe) {
             camByDesc = NLWIsCameraGestureByDescription(g);
+            // ★ 只在真的是左滑时才去算宿主：NLWIsSuppressibleLockScreenArea
+            //   要走 superview 链，能省就省（addGestureRecognizer 是热路径）。
+            if (!camByDesc && NLWIsCameraSwipeBySwipe(g)) {
+                camBySwipe = (NLWIsSystemGestureHost((UIView *)self) ||
+                              NLWIsLockScreenWindowHost((UIView *)self) ||
+                              NLWIsSuppressibleLockScreenArea((UIView *)self));
+            }
         }
-        if (gEnabled && (NLWIsLongPressish(g) || camByDesc ||
+        if (gEnabled && (NLWIsLongPressish(g) || camByDesc || camBySwipe ||
                          (gBlockCameraSwipe && NLWIsCameraSwipeish(g, (UIView *)self)))) {
-            hit = camByDesc ? YES : NLWIsSuppressibleLockScreenArea((UIView *)self);
+            hit = (camByDesc || camBySwipe) ? YES
+                : NLWIsSuppressibleLockScreenArea((UIView *)self);
         }
     } @catch (NSException *e) { }
 
