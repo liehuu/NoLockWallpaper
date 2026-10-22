@@ -1,0 +1,107 @@
+name: Build Package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+env:
+  # ★ 版本号单一来源：build.yml 的 env 与 mkdeb.sh 的入参由这里统一派生，
+  #   禁止在别处硬编码（SingleVPN 踩过「包名 2.7、内容 2.8」的坑）。
+  VERSION: 1.0-1
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 第一道闸：源码级静态校验。不依赖工具链，秒级完成。
+  #
+  # ★ 检查项以「运行期会崩」为主，不只查「编不过」。
+  #   SingleVPN v2.3 那四个 bug 全部能通过编译，静态 lint 一条都抓不到，
+  #   最终导致用户手机进安全模式。所以这里的重点是崩宿主维度：
+  #     - 每个 hook 是否整体包 @try/@catch
+  #     - orig 转发前是否判空
+  #     - hook 安装是否区分「自己的实现」与「继承来的」（否则污染父类）
+  #     - 是否下钻子视图（会误伤通知/手电筒长按）
+  #     - 热路径是否写盘（watchdog 会杀进程）
+  # ---------------------------------------------------------------------
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify architecture constraints
+        run: |
+          set -e
+          echo "--- 架构约束：不得依赖私有 selector ---"
+          # 本项目的核心设计就是「只用公开 API」，一旦有人加了私有符号，
+          # 就会重新引入「签名猜错 → 崩宿主」的风险。
+          if grep -nE '@selector\((_|setWallpaper|deactivateWallpaper)' Tweak.m; then
+            echo "✗ 出现私有 selector，违反本项目架构约束"
+            exit 1
+          fi
+          echo "✓ 无私有 selector"
+
+      - name: Source self-check
+        run: |
+          set -e
+          python3 tools/check_source.py
+
+  # ---------------------------------------------------------------------
+  # 构建：**不安装 Theos**。
+  #
+  # 用户明确要求过「别用安装 theos 这个方案了，之前构建其他的 deb 很快」。
+  # 实测：Setup Theos 680s → 零 Theos 全流程约 24s。
+  # 本项目更简单：没有 Logos 语法，连 logos.pl 都不用下载。
+  #
+  # 只用：xcrun clang 编 dylib → codesign 自签 → mkdeb.sh 拼 deb。
+  # ---------------------------------------------------------------------
+  build:
+    needs: verify
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Show toolchain
+        run: |
+          set -e
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Build (arm64e / roothide)
+        run: |
+          set -e
+          sh devkit/build.sh arm64e iphoneos-arm64e "$VERSION"
+          cp .build/out/*.deb .
+
+      - name: Build (arm64 / rootless)
+        run: |
+          set -e
+          sh devkit/build.sh arm64 iphoneos-arm64 "$VERSION"
+          cp .build/out/*.deb .
+
+      - name: Report packages
+        run: |
+          set -e
+          echo "--- 产物 ---"
+          ls -l *.deb
+          for f in *.deb; do
+            echo ""
+            echo "== $f =="
+            echo "size   : $(wc -c < "$f")"
+            echo "sha256 : $(shasum -a 256 "$f" | cut -d' ' -f1)"
+          done
+
+      - name: Upload Packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ env.VERSION }}
+          path: "*.deb"
+          if-no-files-found: error
