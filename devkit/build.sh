@@ -130,6 +130,15 @@ for sym in UIScreenEdgePanGestureRecognizer edges Camera; do
     || { echo "✗ dylib 缺 ${sym}（禁左滑进相机会失效）"; exit 1; }
 done
 
+# ★ 1.8-1：真正管住「左滑进相机」的两个私有 getter
+#   两个都必须出现在产物里 —— 缺 hasCamera 只是按钮不消失，
+#   缺 lockScreenCameraSupported 就是**左滑照进**（1.7-1 的真实故障）。
+#   这两个名字是选择子名，编译后保留在 __objc_methname，可直接 grep。
+for sym in hasCamera lockScreenCameraSupported; do
+  grep -aq "$sym" "$BUILD/NoLockWallpaper.dylib" \
+    || { echo "✗ dylib 缺 ${sym}（禁左滑进相机会失效）"; exit 1; }
+done
+
 # 设置页开关读取指纹：配置域名与两个键名
 for sym in com.liehuu.nolockwallpaper Enabled BlockCameraSwipe \
            com.liehuu.nolockwallpaper/changed; do

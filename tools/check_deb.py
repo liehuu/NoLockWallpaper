@@ -592,7 +592,10 @@ def check_deb(path):
         for needle in (b"com.liehuu.nolockwallpaper", b"Enabled",
                        b"BlockCameraSwipe",
                        b"com.liehuu.nolockwallpaper/changed",
-                       b"UIScreenEdgePanGestureRecognizer", b"edges"):
+                       b"UIScreenEdgePanGestureRecognizer", b"edges",
+                       # ★ 1.8-1：禁左滑进相机的真正开关。缺 lockScreen 那个
+                       #   就是 1.7-1 的真实故障（按钮没了、左滑照进）。
+                       b"hasCamera", b"lockScreenCameraSupported"):
             chk("主 dylib 含开关/相机指纹 %s" % needle.decode(), needle in body)
         # ★★ 绝不在这里查 UIRectEdgeRight —— 它是**枚举常量**，值是 8，
         #   编译后是 `and w8, w0, #8` 这类指令里的立即数，

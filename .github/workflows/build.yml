@@ -54,7 +54,19 @@ env:
   #   两个 selref，对应 hook 函数 0x736c/0x7374 均为 `mov w0,#0; ret`。
   #   本版只跟 hasCamera（不动手电筒），开关关闭时转发原实现（实时生效，
   #   不留恢复负担）。代价：锁屏相机按钮也会一起消失，交付说明里写明。
-  VERSION: 1.7-1
+  # ★ 1.8-1：**第五次修复**。1.7-1 实机反馈「左滑照样进相机」——
+  #   只 hook `-hasCamera` 管的是**按钮显不显示**，管不到「相机页要不要挂载」。
+  #   第二份参考插件（com.yccameraflight 1.1「隐藏相机手电筒，禁用左滑」）
+  #   解开后答案完整：它 hook 的是**三个**方法，第三个才是关键 ——
+  #     SpringBoard -lockScreenCameraSupported  →  NO
+  #   反汇编证据（__text @0x7e6c，共 160 字节；__objc_selrefs 恰好 3 项）：
+  #     0x7e78 adr "CSQuickActionsViewController" → 0x7e8c/0x7ea8 hook
+  #            hasCamera / hasFlashlight（均 mov w0,#0; ret）
+  #     0x7ec4 adr "SpringBoard" → 0x7ed4 selref lockScreenCameraSupported
+  #            → 0x7f04 也是 mov w0,#0; ret
+  #   本版加上第三个 hook，实例方法与类方法都探测（不确定它挂在哪张表上），
+  #   装不上时扫描全类把真正的宿主写进日志 —— 下次不用再猜。
+  VERSION: 1.8-1
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 

@@ -430,6 +430,141 @@ CASES = [
         "static BOOL NLWInstallHasCameraHookRemoved(void)",
         "有 hasCamera hook 安装函数",
     ),
+
+    # ------------------------------------------------------------------
+    # 1.8-1：lockScreenCameraSupported（真正管住左滑的那一层）
+    # ★ 这一组每条都对应一个「静默失效」的真实形态：
+    #   装上去了、日志还显示成功，但功能没生效 —— 最难排查的那一类。
+    # ------------------------------------------------------------------
+    (
+        "★ 只探测实例方法（若它其实是类方法，装上等于没装，且日志显示成功）",
+        "        Method mc = class_getClassMethod(c, sel);",
+        "        Method mc = NULL;",
+        "同时探测实例方法与类方法",
+    ),
+    (
+        "★ 类方法装到类本身而不是元类（等于没装，日志照样写已装上）",
+        "            Class meta = object_getClass(c);\n"
+        "            const char *enc = method_getTypeEncoding(mc);",
+        "            Class meta = c;\n"
+        "            const char *enc = method_getTypeEncoding(mc);",
+        "类方法走 object_getClass 取元类再装",
+    ),
+    (
+        "★ 实例与类方法共用同一个 orig（转发到另一张方法表的原实现）",
+        "static IMP gOrigLSCamMeta = NULL;    // 类方法原实现",
+        "static IMP gOrigLSCamDummy = NULL;   // 类方法原实现",
+        "实例与类方法各有自己的 orig 变量",
+    ),
+    (
+        "★ 类方法 hook 体错用了实例方法的 orig",
+        '    return NLWLSCamBody(self, _cmd, gOrigLSCamMeta, "meta");',
+        '    return NLWLSCamBody(self, _cmd, gOrigLSCamInst, "meta");',
+        "两个 hook 体分别引用各自的 orig",
+    ),
+    (
+        "★ 其中一条路径只收 B@:（真实签名是 c@: 时被误跳过）",
+        "            const char *enc = method_getTypeEncoding(mi);\n"
+        "            if (enc && (strncmp(enc, \"B@:\", 3) == 0 ||\n"
+        "                        strncmp(enc, \"c@:\", 3) == 0)) {",
+        "            const char *enc = method_getTypeEncoding(mi);\n"
+        "            if (enc && (strncmp(enc, \"B@:\", 3) == 0)) {",
+        "签名校验接受 B@: 与 c@:",
+    ),
+    (
+        "★ 安装时写死编码（真实签名不同则造出签名不符的方法）",
+        "                if (NLWInstallHook(c, sel, (IMP)NLWLSCamInst, &o, enc)) {",
+        '                if (NLWInstallHook(c, sel, (IMP)NLWLSCamInst, &o, "B@:")) {',
+        "用真实 enc 安装（不写死 B@:）",
+    ),
+    (
+        "hook 体只看总开关（相机子开关拨了没反应）",
+        "static BOOL NLWLSCamBody(id self, SEL _cmd, IMP orig, const char *kind)\n"
+        "{\n"
+        "    BOOL blocked = NO;\n"
+        "    @try {\n"
+        "        blocked = (gEnabled && gBlockCameraSwipe);\n",
+        "static BOOL NLWLSCamBody(id self, SEL _cmd, IMP orig, const char *kind)\n"
+        "{\n"
+        "    BOOL blocked = NO;\n"
+        "    @try {\n"
+        "        blocked = gEnabled;\n",
+        "hook 体：两个开关都要尊重",
+    ),
+    (
+        "★ 开关关闭时不转发原实现（锁屏相机永久消失，开关变假）",
+        "    if (!blocked) {\n"
+        "        if (orig) {\n"
+        "            return ((BOOL (*)(id, SEL))orig)(self, _cmd);",
+        "    if (!blocked) {\n"
+        "        if (orig) {\n"
+        "            return YES;",
+        "hook 体：开关关着就转发原实现",
+    ),
+    (
+        "★ orig 判空被删（orig 为 NULL 时调空指针 = 必崩）",
+        "        if (orig) {\n"
+        "            return ((BOOL (*)(id, SEL))orig)(self, _cmd);",
+        "        if (YES) {\n"
+        "            return ((BOOL (*)(id, SEL))orig)(self, _cmd);",
+        "hook 体：orig 为空时保守放行",
+    ),
+    (
+        "hook 体参数个数写错（与 B@: 不符即崩）",
+        "static BOOL NLWLSCamInst(id self, SEL _cmd)",
+        "static BOOL NLWLSCamInst(id self, SEL _cmd, id extra)",
+        "hook 体是两参无参 getter 原型",
+    ),
+    (
+        "★ 全类扫描改成无条件执行（每次开机白烧几十毫秒，且含 IO）",
+        "        if (!gotInst && !gotMeta) {\n"
+        '            NLWDiagAdd(@"[hook] -lockScreenCameraSupported 未装成 → 开始找真正宿主");\n'
+        '            NLWScanForMethod("lockScreenCameraSupported");\n'
+        "            return NO;\n"
+        "        }",
+        '        NLWScanForMethod("lockScreenCameraSupported");\n'
+        "        if (!gotInst && !gotMeta) {\n"
+        '            NLWDiagAdd(@"[hook] -lockScreenCameraSupported 未装成 → 开始找真正宿主");\n'
+        "            return NO;\n"
+        "        }",
+        "全类扫描只在「没装成」时触发",
+    ),
+    (
+        "★ 方法不存在也硬上（本项目最高等级缺陷：崩宿主）",
+        "        if (!gotInst && !gotMeta) {",
+        "        if (NO) {",
+        "方法/类不存在时干净跳过",
+    ),
+    (
+        "★ 目标类写成别的类（hook 不到真正宿主，功能全废）",
+        'NSClassFromString(@"SpringBoard")',
+        'NSClassFromString(@"SBHomeScreenController")',
+        "目标类精确为 SpringBoard",
+    ),
+    (
+        "★ 选择子名写错（hook 到不存在的方法，静默失败）",
+        "        SEL sel = @selector(lockScreenCameraSupported);",
+        "        SEL sel = @selector(lockScreenCameraAvailable);",
+        "选择子确实是 lockScreenCameraSupported",
+    ),
+    (
+        "安装函数改名（等于整段被删）",
+        "static BOOL NLWInstallLSCamHook(void)",
+        "static BOOL NLWInstallLSCamHookRemoved(void)",
+        "有 lockScreenCameraSupported 安装函数",
+    ),
+    (
+        "★ 装了但 NLWInit 里没调用（1.8-1 等于没改）",
+        "        NLWInstallLSCamHook();\n",
+        "",
+        "在 NLWInit 里真正调用了 LSCam 安装函数",
+    ),
+    (
+        "★ 为了「省一层」把 hasCamera 删掉（按钮会回来）",
+        "        NLWInstallHasCameraHook();\n",
+        "",
+        "hasCamera 与 lockScreenCameraSupported 两层都在",
+    ),
 ]
 
 # ★ B 组：构建闸门本身的判据写错（真实误报过一次，潜伏三个 run 才暴露）
@@ -635,9 +770,9 @@ CHECKDEB_CASES = [
         # ★ 本轮真实翻车原样复现：UIRectEdgeRight 是枚举值 8，
         #   产物里一个字节都没有 → 判据必然 FAIL，而产物完全正确。
         "用枚举常量做产物指纹（该名字编译后不存在，判据必然误杀）",
-        'b"UIScreenEdgePanGestureRecognizer", b"edges"):',
+        'b"UIScreenEdgePanGestureRecognizer", b"edges",',
         'b"UIScreenEdgePanGestureRecognizer", b"edges",\n'
-        '                       b"UIRectEdgeRight"):',
+        '                       b"UIRectEdgeRight",',
         "check_deb.py 不用枚举常量做产物指纹",
     ),
     (

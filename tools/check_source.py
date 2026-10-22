@@ -478,11 +478,17 @@ for f in forbidden:
 #   相机入口是懒启用的，压制它的唯一办法就是拦这个 setter。
 hooked_sel = re.findall(r"@selector\(([^)]+)\)", code)
 allowed = {"addGestureRecognizer:", "didMoveToWindow", "viewDidAppear:",
-           "setEnabled:", "hasCamera"}
+           "setEnabled:", "hasCamera", "lockScreenCameraSupported"}
 # ★ 1.7-1 加 `hasCamera`：它不是「放宽纪律」，而是本项目 hook 面唯一一个
 #   私有 API，且是**无参 getter**（返回值 BOOL，签名无歧义）——
 #   与「hook 私有方法要猜参数个数」的风险完全不是一个量级。
 #   它替换掉的是前四版全部失败的手势判据（见 [A4j]）。
+# ★ 1.8-1 加 `lockScreenCameraSupported`：同样是**无参 getter**，
+#   同样有反汇编证据（com.yccameraflight 1.1 的 __text 里第三处
+#   `ldr x1, selref lockScreenCameraSupported` + `mov w0,#0; ret`），
+#   不是猜出来的名字。它才是「左滑进相机」的真正开关（见 [A4k]）。
+#   两个私有 selector 都不是「放宽纪律」：本项目的纪律是
+#   **不猜私有方法名**，而这两个名字都有现成产物的反汇编作证。
 extra = [s.strip() for s in hooked_sel if s.strip() not in allowed]
 chk("只 hook 了公开 API", not extra, "多出的：%s" % extra if extra else
     "addGestureRecognizer: / didMoveToWindow / viewDidAppear: / setEnabled:")
@@ -550,6 +556,50 @@ chk("压制循环里对相机入口类做了即时压制（hook 管将来，这�
 
 # =====================================================================
 print("\n[A4j] 1.7-1：让系统认为「这台设备没有相机」")
+
+# ---------------------------------------------------------------------
+# ★ 函数体提取工具（A4j / A4k 共用）
+#   ★★ 为什么必须有它：1.8-1 新增了第二个 hook，源码里出现了多处
+#   「看起来一样」的写法（`&o, enc)`、`blocked = (gEnabled && ...)`、
+#   签名校验块）。判据如果还按全文搜索，**改坏其中一处仍会被另一处满足** ——
+#   反向验证当场抓到了三条漏放（A36/A37/A39）。这就是
+#   「新增一处正确实现 → 旧判据悄悄失效」的典型形态。
+#   所以凡是「某个函数里必须怎么写」的判据，必须限定在函数体内。
+# ---------------------------------------------------------------------
+
+
+def _body_of(sig_regex, text=None):
+    """按大括号配平取出函数体；取不到返回空串。
+
+    ★ text 默认是 code（去注释 + 清空字符串字面量）。
+      凡是判据里要匹配**字符串字面量内容**（类名、"B@:" 之类）的，
+      必须显式传 src —— strip_code 会把引号里的内容换成空格，
+      在 code 上查字符串必然假红（这个坑本项目已经踩过两次）。
+    """
+    hay = code if text is None else text
+    m = re.search(sig_regex, hay)
+    if not m:
+        return ""
+    start = hay.find("{", m.end())
+    if start < 0:
+        return ""
+    depth, i = 0, start
+    while i < len(hay):
+        if hay[i] == "{":
+            depth += 1
+        elif hay[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return hay[start:i + 1]
+        i += 1
+    return ""
+
+
+_has_install = _body_of(r"static BOOL NLWInstallHasCameraHook\(void\)")
+_has_install_src = _body_of(r"static BOOL NLWInstallHasCameraHook\(void\)", src)
+_has_body = _body_of(r"static BOOL NLWHasCamera\(id self, SEL _cmd\)")
+
+
 # ★★★ 为什么这一组必须存在 —— 前四版全部失败，第五版才走对路：
 #   1.3-1 判 edge pan、1.4-1 判自述、1.5-1 判 swipe、1.6-1 拦 setEnabled，
 #   四轮全部由实机日志推翻。1.6-1 的日志尤其决定性：
@@ -604,16 +654,19 @@ chk("★ 没有顺手禁掉手电筒（hasFlashlight 不得出现）",
 
 chk("★ 签名不符时干净跳过（enc 必须校验 B@: / c@:）",
     # ★ 这是崩宿主防线：签名不对还硬上，等于用错参数个数调原实现。
-    re.search(r'strncmp\(enc,\s*"B@:",\s*3\)', src) is not None
-    and re.search(r'strncmp\(enc,\s*"c@:",\s*3\)', src) is not None,
-    "" if re.search(r'strncmp\(enc,\s*"B@:",\s*3\)', src) else
+    # ★ 限定在 hasCamera 的安装函数体内：1.8-1 又加了一个同样写法的
+    #   安装函数，全文搜索会在改坏这一处时被另一处满足。
+    re.search(r'strncmp\(enc,\s*"B@:",\s*3\)', _has_install_src) is not None
+    and re.search(r'strncmp\(enc,\s*"c@:",\s*3\)', _has_install_src) is not None,
+    "" if re.search(r'strncmp\(enc,\s*"B@:",\s*3\)', _has_install_src) else
     "没校验签名 → 万一 Apple 改签名就是必崩")
 
 chk("安装时用真实 enc 而非写死字面量",
     # ★ class_addMethod 用错编码会造出一个签名不符的方法，
     #   之后系统按错误签名调用 = 参数错位。必须传 method_getTypeEncoding 的结果。
-    re.search(r"&o,\s*enc\)", code) is not None,
-    "" if "&o, enc)" in code else "写死了编码 → addMethod 可能造出错误签名")
+    re.search(r"&o,\s*enc\)", _has_install) is not None,
+    "" if "&o, enc)" in _has_install else
+    "写死了编码 → addMethod 可能造出错误签名")
 
 chk("hasCamera hook 体：开关关着就转发原实现",
     # ★ 实时生效的实现方式：不是「改回 IMP」，而是每次调用看开关。
@@ -625,13 +678,15 @@ chk("hasCamera hook 体：开关关着就转发原实现",
 
 chk("开关判断用 gEnabled && gBlockCameraSwipe",
     # ★ 两个开关都要尊重：总开关关了要放行，子开关关了也要放行。
-    # ★ 判据必须锚到 `blocked = (...)` 这个赋值 —— 源码里
-    #   NLWSetEnabled 也有 `if (gEnabled && gBlockCameraSwipe)`，
-    #   只查到那一处就会漏放「hasCamera 只看总开关」这种错。
-    re.search(r"blocked\s*=\s*\(gEnabled\s*&&\s*gBlockCameraSwipe\)", code)
-    is not None,
-    "" if re.search(r"blocked\s*=\s*\(gEnabled\s*&&\s*gBlockCameraSwipe\)", code)
-    else "只看一个开关 → 另一个开关拨了没反应")
+    # ★ 判据必须锚到 `blocked = (...)` 这个赋值，且限定在 hasCamera 的
+    #   hook 体内 —— 源码里 NLWSetEnabled / NLWLSCamBody 都有同名表达式，
+    #   全文搜索会在这两处满足，改坏 hasCamera 那处也发现不了
+    #   （反向验证 A39 就是这么漏放的）。
+    re.search(r"blocked\s*=\s*\(gEnabled\s*&&\s*gBlockCameraSwipe\)",
+              _has_body) is not None,
+    "" if re.search(r"blocked\s*=\s*\(gEnabled\s*&&\s*gBlockCameraSwipe\)",
+                    _has_body) else
+    "只看一个开关 → 另一个开关拨了没反应")
 
 chk("orig 指针存在且有判空",
     "static IMP gOrigHasCamera" in code and
@@ -642,6 +697,153 @@ chk("在 NLWInit 里真正调用了安装函数",
     re.search(r"^\s*NLWInstallHasCameraHook\(\s*\);", code, re.M) is not None,
     "" if re.search(r"^\s*NLWInstallHasCameraHook\(\s*\);", code, re.M) else
     "函数写了但没调用 → 永远不生效")
+
+# =====================================================================
+print("\n[A4k] 1.8-1：lockScreenCameraSupported —— 真正管住「左滑」的那一层")
+# ★★ 为什么这一组必须存在：
+#   1.7-1 只 hook 了 `-hasCamera`，实机结果「按钮可能没了，左滑照进」。
+#   逆向 com.yccameraflight 1.1 得到答案：还有第三个 hook ——
+#   SpringBoard 的 `-lockScreenCameraSupported`。
+#   这一组锁的是「这一个 hook 真的被正确装上、且能被开关关掉」。
+#
+# ★ 最容易静默失效的三个点，逐条设卡：
+#   ① 只探测实例方法 → 若它其实是类方法，装上等于没装（不报错）；
+#   ② 实例与类方法共用同一个 orig 变量 → 转发到错的原实现；
+#   ③ 方法不存在时硬上 → 崩宿主（本项目最高等级缺陷）。
+#   （_body_of 已在上面的 A4j 段定义，两组共用。）
+
+
+chk("有 lockScreenCameraSupported 安装函数",
+    # ★ 用正则锚函数签名，不用子串 in：
+    #   上轮踩过 —— 改名成 NLWInstallLSCamHookRemoved 也能被 `in` 判过。
+    re.search(r"static BOOL NLWInstallLSCamHook\(void\)", code) is not None)
+
+_lsc_install = _body_of(r"static BOOL NLWInstallLSCamHook\(void\)")
+_lsc_install_src = _body_of(r"static BOOL NLWInstallLSCamHook\(void\)", src)
+
+chk("目标类精确为 SpringBoard",
+    # ★ 查 src：类名是字符串字面量，code 里已被换成空格。
+    re.search(r'NSClassFromString\(@"SpringBoard"\)', _lsc_install_src)
+    is not None,
+    "" if re.search(r'NSClassFromString\(@"SpringBoard"\)', _lsc_install_src)
+    else "类名不是 SpringBoard → hook 不到真正宿主")
+
+chk("选择子确实是 lockScreenCameraSupported",
+    code.count("@selector(lockScreenCameraSupported)") >= 1,
+    "实际 %d 处" % code.count("@selector(lockScreenCameraSupported)") if
+    code.count("@selector(lockScreenCameraSupported)") < 1 else "")
+
+_lsc_install = _body_of(r"static BOOL NLWInstallLSCamHook\(void\)")
+_lsc_install_src = _body_of(r"static BOOL NLWInstallLSCamHook\(void\)", src)
+
+chk("同时探测实例方法与类方法",
+    # ★ 这条是本轮的核心防线：不知道它挂在哪张方法表上，
+    #   只试一种 → 另一种情况下「装上等于没装」，且日志还显示成功。
+    "class_getInstanceMethod" in _lsc_install and
+    "class_getClassMethod" in _lsc_install,
+    "" if ("class_getInstanceMethod" in _lsc_install and
+           "class_getClassMethod" in _lsc_install) else
+    "只探测了一种 → 若实际是另一种，装上等于没装")
+
+chk("类方法走 object_getClass 取元类再装",
+    "object_getClass" in _lsc_install,
+    "" if "object_getClass" in _lsc_install else
+    "类方法必须装在元类上，装到类本身等于没装")
+
+chk("签名校验接受 B@: 与 c@:",
+    # ★ 查 src：两个编码都是字符串字面量。
+    # ★ 要求 count>=2：安装函数里实例、类两条路径各校验一次。
+    #   只查 `in` 的话，把其中一条写成只收 B@: 仍会通过 ——
+    #   那正好是「某个版本被误跳过」的真实故障形态。
+    _lsc_install_src.count('"B@:"') >= 2 and
+    _lsc_install_src.count('"c@:"') >= 2,
+    "实际 B@:=%d c@:=%d（应为各 2）" % (
+        _lsc_install_src.count('"B@:"'), _lsc_install_src.count('"c@:"'))
+    if not (_lsc_install_src.count('"B@:"') >= 2 and
+            _lsc_install_src.count('"c@:"') >= 2) else "")
+
+chk("用真实 enc 安装（不写死 B@:）",
+    # ★ 写死编码会在真实签名是 c@: 时造出签名不符的方法。
+    # ★ 要求**每一处** NLWInstallHook 调用都传 enc，不是「有一处传了就行」。
+    # ★ 正则用贪婪 `[^;]*`：参数里有 `(IMP)xxx` 这种括号，
+    #   非贪婪会在 `(IMP` 处提前收尾，导致 capture 拿不到 enc → 假红。
+    len(re.findall(r"NLWInstallHook\(([^;]*)\)", _lsc_install)) == 2 and
+    all("enc" in a for a in re.findall(r"NLWInstallHook\(([^;]*)\)",
+                                      _lsc_install)),
+    "实际调用 %s" % re.findall(r"NLWInstallHook\(([^;]*)\)", _lsc_install)
+    if not (len(re.findall(r"NLWInstallHook\(([^;]*)\)", _lsc_install)) == 2 and
+            all("enc" in a for a in re.findall(r"NLWInstallHook\(([^;]*)\)",
+                                               _lsc_install))) else "")
+
+chk("实例与类方法各有自己的 orig 变量",
+    "static IMP gOrigLSCamInst" in code and
+    "static IMP gOrigLSCamMeta" in code,
+    "" if ("static IMP gOrigLSCamInst" in code and
+           "static IMP gOrigLSCamMeta" in code) else
+    "共用 orig → 一个转发到另一个的原实现，必错")
+
+chk("两个 hook 体分别引用各自的 orig",
+    re.search(r"NLWLSCamBody\(self,\s*_cmd,\s*gOrigLSCamInst", code) is not None and
+    re.search(r"NLWLSCamBody\(self,\s*_cmd,\s*gOrigLSCamMeta", code) is not None,
+    "" if (re.search(r"NLWLSCamBody\(self,\s*_cmd,\s*gOrigLSCamInst", code) and
+           re.search(r"NLWLSCamBody\(self,\s*_cmd,\s*gOrigLSCamMeta", code))
+    else "两个 hook 体没有分别传自己的 orig")
+
+_lsc_body = _body_of(r"static BOOL NLWLSCamBody\(id self, SEL _cmd, IMP orig")
+
+chk("hook 体：开关关着就转发原实现",
+    re.search(r"if\s*\(!blocked\)", _lsc_body) is not None and
+    re.search(r"orig\)\s*\{\s*return\s*\(\(BOOL", _lsc_body) is not None,
+    "" if (re.search(r"if\s*\(!blocked\)", _lsc_body) and
+           re.search(r"orig\)\s*\{\s*return\s*\(\(BOOL", _lsc_body)) else
+    "关掉开关后不转发 → 开关是假的")
+
+chk("hook 体：orig 为空时保守放行（绝不返回 NO 之外的东西乱来）",
+    re.search(r"if\s*\(orig\)", _lsc_body) is not None,
+    "" if re.search(r"if\s*\(orig\)", _lsc_body) else "没判空 → 可能调空指针")
+
+chk("hook 体：两个开关都要尊重",
+    re.search(r"blocked\s*=\s*\(gEnabled\s*&&\s*gBlockCameraSwipe\)",
+              _lsc_body) is not None,
+    "" if re.search(r"blocked\s*=\s*\(gEnabled\s*&&\s*gBlockCameraSwipe\)",
+                    _lsc_body) else "只看一个开关 → 另一个开关拨了没反应")
+
+chk("hook 体是两参无参 getter 原型（id, SEL）",
+    re.search(r"static BOOL NLWLSCamBody\(id self, SEL _cmd", code) is not None and
+    re.search(r"static BOOL NLWLSCamInst\(id self, SEL _cmd\)", code) is not None and
+    re.search(r"static BOOL NLWLSCamMeta\(id self, SEL _cmd\)", code) is not None,
+    "" if (re.search(r"static BOOL NLWLSCamBody\(id self, SEL _cmd", code) and
+           re.search(r"static BOOL NLWLSCamInst\(id self, SEL _cmd\)", code) and
+           re.search(r"static BOOL NLWLSCamMeta\(id self, SEL _cmd\)", code))
+    else "参数个数不是 (id, SEL) → 与 B@: 不符")
+
+chk("方法/类不存在时干净跳过（不硬上）",
+    "NLWScanForMethod" in _lsc_install and
+    re.search(r"if\s*\(!gotInst\s*&&\s*!gotMeta\)", _lsc_install) is not None,
+    "" if ("NLWScanForMethod" in _lsc_install and
+           re.search(r"if\s*\(!gotInst\s*&&\s*!gotMeta\)", _lsc_install)) else
+    "没装成也没有兜底路径 → 下次还是只能猜")
+
+chk("全类扫描只在「没装成」时触发（不在启动时无条件跑）",
+    # ★ 扫描要遍历几千个类，属于启动期开销。
+    #   无条件跑 = 每次开机都白花几十毫秒，且没人看日志。
+    re.search(r"if\s*\(!gotInst\s*&&\s*!gotMeta\)\s*\{[^}]*NLWScanForMethod",
+              code, re.S) is not None,
+    "" if re.search(r"if\s*\(!gotInst\s*&&\s*!gotMeta\)\s*\{[^}]*NLWScanForMethod",
+                    code, re.S) else "扫描位置不对")
+
+chk("在 NLWInit 里真正调用了 LSCam 安装函数",
+    re.search(r"^\s*NLWInstallLSCamHook\(\s*\);", code, re.M) is not None,
+    "" if re.search(r"^\s*NLWInstallLSCamHook\(\s*\);", code, re.M) else
+    "函数写了但没调用 → 1.8-1 等于没改")
+
+chk("hasCamera 与 lockScreenCameraSupported 两层都在（缺一不可）",
+    re.search(r"^\s*NLWInstallHasCameraHook\(\s*\);", code, re.M) is not None and
+    re.search(r"^\s*NLWInstallLSCamHook\(\s*\);", code, re.M) is not None,
+    "" if (re.search(r"^\s*NLWInstallHasCameraHook\(\s*\);", code, re.M) and
+           re.search(r"^\s*NLWInstallLSCamHook\(\s*\);", code, re.M)) else
+    "少了一层 → 按钮或左滑会有一个漏掉")
+
 
 # =====================================================================
 print("\n[A7] 热路径零 IO（watchdog 会杀进程）")
