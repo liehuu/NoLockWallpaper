@@ -391,10 +391,22 @@ chk("NLWProcessView 用误伤防护判据（不是裸祖先链）",
     "NLWIsSuppressibleLockScreenArea(v)" in code,
     "" if "NLWIsSuppressibleLockScreenArea(v)" in code else "用了宽判据会误伤通知长按")
 chk("addGestureRecognizer 用同一判据（两处逻辑一致）",
-    # ★ 期望值要精确：定义 1 次 + 两处调用 = 3 次。
-    #   （上一版写成 >=4 是预期值本身错，属于本项目踩过的「闸门自己错」。）
-    code.count("NLWIsSuppressibleLockScreenArea") == 3,
-    "引用 %d 次（应为 1 定义 + 2 调用）" % code.count("NLWIsSuppressibleLockScreenArea"))
+    # ★ 判据意图：确认**两处主逻辑**（addGestureRecognizer 与 NLWProcessView）
+    #   都调用同一个误伤防护函数，而不是各自写一套。
+    #
+    # ★ 为什么不用「精确等于 3 次」：
+    #   上一版就是 `== 3`，本轮加诊断代码多调用一次 → 立刻误报 exit 1。
+    #   而那个多出来的调用是完全正确的。**「数量精确等于 N」这种写法，
+    #   每次有合理的新增调用就会假红一次** —— 属于「闸门自己写错」的典型。
+    #   正解：验证「必须存在的调用形态都在」，数量只做下界。
+    code.count("NLWIsSuppressibleLockScreenArea") >= 3
+    and "static BOOL NLWIsSuppressibleLockScreenArea" in code
+    and "NLWIsSuppressibleLockScreenArea((UIView *)self)" in code
+    and "NLWIsSuppressibleLockScreenArea(v)" in code,
+    "引用 %d 次，add=%s process=%s" % (
+        code.count("NLWIsSuppressibleLockScreenArea"),
+        "NLWIsSuppressibleLockScreenArea((UIView *)self)" in code,
+        "NLWIsSuppressibleLockScreenArea(v)" in code))
 
 # =====================================================================
 print("\n[A6] 私有 selector 零依赖（只允许公开 API）")
