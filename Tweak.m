@@ -504,8 +504,87 @@ static BOOL NLWIsCameraSwipeBySwipe(UIGestureRecognizer *g)
 }
 
 // ============================================================================
-//  四点五、临时诊断（1.3-1 专用；定位完必须整块删除）
+//  四之四、1.6-1 新增：从「拦截手势」改为「拦截启用」
 // ============================================================================
+//
+// ★★ 为什么前两版都没修好 —— 1.5-1 日志给出的第三个硬证据（2026-10-22）：
+//   放宽到「任何类型」之后，日志里出现了 50 个手势类，但：
+//     · `dir=` 全是 `-`（一个 UISwipeGestureRecognizer 都没有）
+//     · `camera` 依然 0 次
+//     · `edges=8` 依然 0 次
+//   说明相机手势既不是 pan、也不是 swipe、类名里也没有 camera。
+//
+//   但同一份日志里出现了两个**从未被注意**的东西：
+//
+//     CSHorizontalScrollFailureRecognizer
+//        baseClass = UIGestureRecognizer      （既非 pan 也非 swipe）
+//        enabled   = NO                       （默认关闭，用时才开）
+//        target    = CSScrollGestureController
+//        action    = _horizontalScrollFailureGestureRecognizerChanged:
+//        chain     = CSCoverSheetView > ... > SBCoverSheetWindow
+//
+//     _UIPendingEdgeSwipeGestureRecognizer / UIImmediateEdgeSwipeGestureRecognizer
+//        target    = __UISystemGestureManager
+//        enabled   = NO
+//
+//   ★ 关键认识（这一版真正的转折点）：
+//     **它们是「默认关闭、需要时才被启用」的手势。**
+//     而前三版的压制手段只有一招：把 `enabled` 设成 NO。
+//     对一个**本来就已经是 NO** 的手势来说，这一招**等于什么都没做** ——
+//     系统随后调用 `setEnabled:YES` 把它打开，我们就再也拦不住了。
+//
+//     ★ 通用规律：**压制一个「懒启用」的组件，改它的当前状态是无效的，
+//       必须拦截「启用」这个动作本身。**
+//       这类组件的共同特征：初始状态就是关闭，所以任何「设成关闭」的
+//       压制都不会留下痕迹，看起来像"成功压制了"，其实一直没生效。
+//
+// ★ 为什么选 `CSHorizontalScrollFailureRecognizer` 作为主目标：
+//   iOS 锁屏从右边缘左滑进相机，实现的本质是「水平滑动失败」——
+//   CoverSheet 的滚动视图横向滚不动，系统把这个失败转交给相机。
+//   这个类名（HorizontalScrollFailure）+ 宿主（CSCoverSheetView）
+//   + target（CSScrollGestureController）三者完全吻合这条链路。
+//
+// ★ 为什么 hook `-setEnabled:` 是安全的：
+//   ① 它是 `UIGestureRecognizer` 的**公开属性 setter**，签名 `v@:B` 明确无歧义
+//      （对比 hook 私有方法：私有方法连参数个数都靠猜，猜错就崩宿主）；
+//   ② 只改一个 BOOL 标志位，不涉及任何对象生命周期；
+//   ③ 全程 @try，异常不外泄；
+//   ④ orig 为 NULL 时直接不转发之外什么都不做 —— 由安装函数保证
+//      「拿不到 orig 就不装 hook」，不会出现「装了但没法转发」的死局。
+
+/// 类名是否「相机入口」——硬判定，命中即拒绝启用。
+///
+/// ★ 只认两条，宁缺勿滥（每多认一条，就多一份误伤面）：
+///   · 类名带 Camera          —— 语义明确
+///   · 类名带 HorizontalScrollFailure —— 锁屏相机入口的标准实现
+static BOOL NLWIsCameraEntryGestureClass(const char *n)
+{
+    if (!n) return NO;
+    if (strstr(n, "Camera")) return YES;
+    if (strstr(n, "HorizontalScrollFailure")) return YES;
+    return NO;
+}
+
+/// 是否「值得记录启用时机」的候选类。
+///
+/// ★ 与上面的硬判定分开：这些只记录、不拦截。
+///   `_UIPendingEdgeSwipe` / `UIImmediateEdgeSwipe` 是 UIKit 的
+///   **边缘手势仲裁器**（target 是 __UISystemGestureManager），
+///   不是相机本身。拦它们会破坏仲裁，可能导致别的边缘手势失灵 ——
+///   所以这一版只观察它们的启用时机，用日志确认它们到底负不负责相机。
+static BOOL NLWIsCameraEntryCandidateClass(const char *n)
+{
+    if (!n) return NO;
+    if (NLWIsCameraEntryGestureClass(n)) return YES;
+    if (strstr(n, "EdgeSwipe")) return YES;      // Pending / Immediate 两种
+    if (strstr(n, "Grabber")) return YES;        // 各类把手
+    return NO;
+}
+
+// ============================================================================
+//  四点五、临时诊断（1.3-1 起；定位完必须整块删除）
+// ============================================================================
+
 //
 // ★ 前向声明（CI 真实失败过，2026-10-22）：
 //   本段插在文件靠前的位置，但它要用的是**后面才定义**的
@@ -606,6 +685,45 @@ static void NLWDiagAdd(NSString *line)
                 NLWDiagFlushNow();
             });
         }
+    } @catch (NSException *e) { }
+}
+
+/// 记录一次 `setEnabled:` 调用（1.6-1 新增）。
+///
+/// ★ 为什么要单独记这个：
+///   前三版一直看不见相机手势，是因为它「默认关闭」——
+///   只有系统在特定时机 `setEnabled:YES` 时它才会出现在视野里。
+///   把「谁被启用了」记下来，等于直接读到系统的心跳。
+///
+/// ★ 为什么按类名限流 8 次：
+///   enable 调用比 add 频繁得多（同一个手势可能被反复开关）。
+///   不限流会在几秒内刷满 200 行的上限，把真正有价值的手势记录挤掉。
+///
+/// ★ 位置说明：本函数必须定义在 NLWDiagAdd **之后** ——
+///   C 不允许隐式声明，反过来写就是 CI 上那句
+///   `call to undeclared function 'NLWDiagAdd'`。
+static NSMutableDictionary *gDiagEnableCount = nil;
+
+static void NLWDiagNoteEnable(const char *clsName, BOOL blocked)
+{
+    @try {
+        NSString *k = (clsName ? [NSString stringWithUTF8String:clsName] : nil);
+        if (!k) return;
+
+        NSUInteger times = 0;
+        @synchronized ([NSFileManager class]) {
+            if (!gDiagEnableCount) gDiagEnableCount = [NSMutableDictionary new];
+            NSNumber *c = gDiagEnableCount[k];
+            times = (c ? c.unsignedIntegerValue : 0) + 1;
+            if (times > 8) return;
+            gDiagEnableCount[k] = @(times);
+        }
+
+        NSString *line = [NSString stringWithFormat:
+            @"[enable#%lu] cls=%@ blocked=%d gEn=%d camSw=%d",
+            (unsigned long)times, k, (int)blocked,
+            (int)gEnabled, (int)gBlockCameraSwipe];
+        NLWDiagAdd(line);
     } @catch (NSException *e) { }
 }
 
@@ -917,6 +1035,20 @@ static NSUInteger NLWProcessView(UIView *v)
                     continue;
                 }
 
+                // ★ 1.6-1 双保险：相机入口类**当前已启用**时直接压一次。
+                //   真正的拦截手段是 `-setEnabled:` hook（拦系统后续的启用），
+                //   这里只负责把「抓到时就已经是 YES」的情况立刻处理掉。
+                //   两者互补：hook 管将来，这里管现在。
+                @try {
+                    if (gBlockCameraSwipe &&
+                        NLWIsCameraEntryGestureClass(
+                            class_getName(object_getClass(g)))) {
+                        NLWSuppressGesture(g);
+                        n++;
+                        continue;
+                    }
+                } @catch (NSException *e) { }
+
                 // ★ 1.4-1：先看手势自己有没有承认是相机。
                 //   这一条不看宿主位置，因为宿主位置这条路已被证明走不通。
                 BOOL camByDesc = (gBlockCameraSwipe &&
@@ -1098,6 +1230,63 @@ static void NLWAddGestureRecognizer(id self, SEL _cmd, UIGestureRecognizer *g)
     if (hit) NLWProcessView((UIView *)self);
 }
 
+// ---- 第 0.5 层（主）：setEnabled: ----
+// 签名：- (void)setEnabled:(BOOL)enabled   →  v@:B
+//
+// ★★ 为什么必须加这一层（1.6-1，本项目的转折点）：
+//   前三版的压制手段只有一招：把 `gesture.enabled` 设成 NO。
+//   而相机入口（CSHorizontalScrollFailureRecognizer）**默认就是 NO** ——
+//   系统在检测到水平滑动时才临时 `setEnabled:YES` 把它打开。
+//
+//   所以前三版对它的压制，效果是：
+//     「把一个已经是 NO 的东西再设一遍 NO」→ 看起来成功了，实际零作用。
+//   系统随后 enable，我们再也拦不住，相机照进。
+//
+//   ★ 通用规律：**压制一个「懒启用」的组件，改它的当前状态是无效的，
+//     必须拦截「启用」这个动作本身。**
+//     判断一个组件是不是懒启用，看两点：
+//       ① 抓到的初始状态就是「关闭」
+//       ② 它有 target/action，说明系统确实会用它
+//     两个都成立时，「设成关闭」这种压制方案从一开始就是假的。
+//
+// ★ 为什么 hook 这个 selector 是安全的：
+//   ① `setEnabled:` 是 UIGestureRecognizer 的**公开属性 setter**，
+//      签名 `v@:B` 明确无歧义 —— 不存在「参数个数猜错」的崩宿主风险；
+//   ② 只影响一个 BOOL 标志位，不碰对象生命周期、不碰内存；
+//   ③ 只在 `enabled == YES` 且类名命中硬判定时才改，其余全部原样转发；
+//   ④ 全程 @try，异常不出线程；
+//   ⑤ 安装函数保证「拿不到 orig 就不装」，不会出现装了却无法转发的死局。
+static IMP gOrigSetEnabled = NULL;
+
+static void NLWSetEnabled(id self, SEL _cmd, BOOL enabled)
+{
+    BOOL block = NO;
+    @try {
+        // ★ 只过问「打开」。「关闭」一律原样放行 —— 我们从不阻止系统
+        //   关闭某个手势，那可能影响它自己的状态机。
+        if (enabled && self) {
+            const char *n = class_getName(object_getClass(self));
+
+            if (NLWIsCameraEntryGestureClass(n)) {
+                if (gEnabled && gBlockCameraSwipe) {
+                    block = YES;
+                    NLWDiagNoteEnable(n, YES);
+                }
+            } else if (NLWIsCameraEntryCandidateClass(n)) {
+                // ★ 候选类（EdgeSwipe / Grabber 等）只记录、不拦截。
+                //   它们更可能是「边缘手势仲裁器」而非相机本身，
+                //   拦下来会破坏仲裁，可能让别的边缘手势失灵。
+                //   记录它们的启用时机，用来在日志里确认谁真正负责相机。
+                NLWDiagNoteEnable(n, NO);
+            }
+        }
+    } @catch (NSException *e) { }
+
+    if (gOrigSetEnabled) {
+        ((void (*)(id, SEL, BOOL))gOrigSetEnabled)(self, _cmd, block ? NO : enabled);
+    }
+}
+
 // ---- 第 1 层（补）：didMoveToWindow ----
 // 签名：- (void)didMoveToWindow   →  v@:
 static void NLWDidMoveToWindow(id self, SEL _cmd)
@@ -1270,6 +1459,28 @@ __attribute__((constructor)) static void NLWInit(void)
             if (NLWInstallHook([UIView class], @selector(didMoveToWindow),
                                (IMP)NLWDidMoveToWindow, &o, "v@:")) {
                 gOrigDidMove = o;
+            }
+        }
+
+        // ---- 第 0.5 层：UIGestureRecognizer -setEnabled: ----
+        // ★★ 为什么必须有这一层（1.6-1）：
+        //   相机入口 `CSHorizontalScrollFailureRecognizer` 是**懒启用**的：
+        //   抓到它时 enabled 就是 NO，系统在检测到水平滑动时才临时打开。
+        //   前三版的压制手段只有 enabled=NO → 对它**完全没有作用**，
+        //   等于一直在压制一个本来就是 NO 的东西。
+        //   必须拦「启用」这个动作本身。
+        //
+        // ★ 为什么 hook 基类 UIGestureRecognizer 而不是具体类：
+        //   具体类名随 iOS 版本变，且我们对「哪个类负责相机」还会有新认识；
+        //   在基类上统一拦，判据集中在 NLWIsCameraEntryGestureClass 一处，
+        //   以后要加目标只改那一个函数。
+        //
+        // ★ 签名 "v@:B" 是公开属性 setter 的标准编码，不存在歧义。
+        {
+            IMP o = NULL;
+            if (NLWInstallHook([UIGestureRecognizer class], @selector(setEnabled:),
+                               (IMP)NLWSetEnabled, &o, "v@:B")) {
+                gOrigSetEnabled = o;
             }
         }
 

@@ -37,7 +37,15 @@ env:
   #   本版：① 新增 swipe 左滑判据；② 诊断放宽到「系统手势窗口/锁屏窗口上
   #   的任何手势类型」（并记 desc/dir），彻底消掉类型盲区。
   #   同时新增 NLWIsLockScreenWindowHost，覆盖「相机挂在锁屏视图树上」这条。
-  VERSION: 1.5-1
+  # ★ 1.6-1：**第三次修复，也是机制层面的转向**。1.5-1 日志（50 个手势类、
+  #   dir 全为 -、camera 0 次）排除了 pan / swipe / 类名三条路，
+  #   但暴露了真正的机制：相机入口是 CSHorizontalScrollFailureRecognizer
+  #   （CSCoverSheetView 上、默认 enabled=NO、target 是 CSScrollGestureController）。
+  #   ★ 前三版的压制手段只有 enabled=NO —— 对它完全无效，因为它本来就是 NO，
+  #     系统在检测到水平滑动时才 setEnabled:YES 打开。
+  #   本版改 hook -[UIGestureRecognizer setEnabled:]，直接拦「启用」这个动作，
+  #   并保留压制循环里的即时压制作为双保险（hook 管将来，这里管现在）。
+  VERSION: 1.6-1
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 

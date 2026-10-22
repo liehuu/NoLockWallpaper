@@ -301,6 +301,59 @@ CASES = [
         "            if (NLWIsPanish(g)) {\n            NSString *d = [g description];",
         "诊断的 desc 不再限定 pan 类",
     ),
+    # ---- 1.6-1 新增：拦「启用」而非「改状态」的六条回归 ----
+    #
+    # 前三版的压制手段只有 enabled=NO，而相机入口抓到时就**已经是 NO** ——
+    # 等于一直在压制一个本来就关闭的东西，看起来成功、实际零作用。
+    # 这六条锁的是「必须拦启用动作、且拦得足够窄、且一定转发原实现」。
+    (
+        "不装 setEnabled hook（懒启用的相机入口再次拦不住）",
+        "@selector(setEnabled:)",
+        "@selector(setEnabledLegacy:)",
+        "安装了 -setEnabled: 的 hook",
+    ),
+    (
+        # ★ 最严重的一条：签名错 = arm64e 上参数错位 = 必崩宿主
+        "setEnabled hook 签名写错（arm64e 参数错位，必崩）",
+        '(IMP)NLWSetEnabled, &o, "v@:B"',
+        '(IMP)NLWSetEnabled, &o, "v@:@"',
+        "setEnabled hook 用 v@:B 签名",
+    ),
+    (
+        "setEnabled hook 连「关闭」也过问（干扰系统状态机）",
+        "        if (enabled && self) {",
+        "        if (self) {",
+        "setEnabled hook 只在「启用」时过问",
+    ),
+    (
+        # 不转发 = enabled 永远改不动 = 所有手势状态错乱，比不生效严重得多
+        "setEnabled hook 不转发原实现（手势状态错乱）",
+        "        ((void (*)(id, SEL, BOOL))gOrigSetEnabled)(self, _cmd, block ? NO : enabled);",
+        "        ;",
+        "setEnabled hook 一定转发原实现",
+    ),
+    (
+        # ★ 误伤方向：把边缘手势仲裁器也拦了
+        "候选类被一起拦截（边缘手势仲裁失效）",
+        "                NLWDiagNoteEnable(n, NO);",
+        "                NLWDiagNoteEnable(n, YES); block = YES;",
+        "候选类只记录、不拦截",
+    ),
+    (
+        "硬判定漏掉 HorizontalScrollFailure（拦不住锁屏相机入口）",
+        '    if (strstr(n, "HorizontalScrollFailure")) return YES;\n',
+        "",
+        "硬判定只认 Camera / HorizontalScrollFailure 两类",
+    ),
+    (
+        # 只有 setEnabled hook，抓到时已经是 YES 的那次补不上
+        "去掉压制循环里的即时压制（已启用的那次漏掉）",
+        "                    if (gBlockCameraSwipe &&\n"
+        "                        NLWIsCameraEntryGestureClass(",
+        "                    if (NO &&\n"
+        "                        NLWIsCameraEntryGestureClass(",
+        "压制循环里对相机入口类做了即时压制",
+    ),
 ]
 
 # ★ B 组：构建闸门本身的判据写错（真实误报过一次，潜伏三个 run 才暴露）

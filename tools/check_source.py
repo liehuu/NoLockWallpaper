@@ -470,12 +470,79 @@ forbidden = [
 for f in forbidden:
     chk("未调用私有符号 %r" % f.strip(), f not in code)
 
-# 只允许 hook 这三个公开 selector
+# 只允许 hook 这几个公开 selector
+#
+# ★ 1.6-1 新增 `setEnabled:`：它是 UIGestureRecognizer 的**公开属性 setter**，
+#   签名 "v@:B" 由编译器保证，不存在「参数个数猜错 → 崩宿主」的风险。
+#   加入白名单不是放宽纪律，而是承认一个事实：
+#   相机入口是懒启用的，压制它的唯一办法就是拦这个 setter。
 hooked_sel = re.findall(r"@selector\(([^)]+)\)", code)
-allowed = {"addGestureRecognizer:", "didMoveToWindow", "viewDidAppear:"}
+allowed = {"addGestureRecognizer:", "didMoveToWindow", "viewDidAppear:",
+           "setEnabled:"}
 extra = [s.strip() for s in hooked_sel if s.strip() not in allowed]
 chk("只 hook 了公开 API", not extra, "多出的：%s" % extra if extra else
-    "addGestureRecognizer: / didMoveToWindow / viewDidAppear:")
+    "addGestureRecognizer: / didMoveToWindow / viewDidAppear: / setEnabled:")
+
+# =====================================================================
+print("\n[A4i] 1.6-1：拦「启用」而不是「改状态」")
+# ★★ 为什么这一组必须存在：
+#   前三版的压制手段只有 `gesture.enabled = NO`。
+#   而相机入口 CSHorizontalScrollFailureRecognizer 抓到时就**已经是 NO** —
+#   系统在检测到水平滑动时才 setEnabled:YES 把它打开。
+#   于是前三版一直在「把已经是 NO 的东西再设一遍 NO」，
+#   看起来压制成功，实际零作用，系统一 enable 相机照进。
+#   这一组锁的是：必须存在一个拦「启用动作」的 hook，且它足够窄。
+
+chk("安装了 -setEnabled: 的 hook",
+    re.search(r"@selector\(setEnabled:\)", code) is not None,
+    "" if "@selector(setEnabled:)" in code else
+    "没有这个 hook，懒启用的相机入口永远拦不住")
+
+chk("setEnabled hook 用 v@:B 签名",
+    # ★ 签名写错 = arm64e 上参数错位 = 必崩宿主。
+    #   公开属性 setter 的编码是固定的 "v@:B"，必须原样使用。
+    # ★ 必须查原始 src：`"v@:B"` 是字符串字面量，strip_code 会把引号内容
+    #   换成空格 → 查 code 必然假红。（本项目第三次踩这个坑了。）
+    re.search(r'\(IMP\)NLWSetEnabled,\s*&o,\s*"v@:B"', src) is not None,
+    "" if re.search(r'\(IMP\)NLWSetEnabled,\s*&o,\s*"v@:B"', src) else
+    "签名不是 v@:B → arm64e 上参数错位，必崩")
+
+chk("setEnabled hook 只在「启用」时过问（关闭一律放行）",
+    re.search(r"if\s*\(\s*enabled\s*&&\s*self\s*\)", code) is not None,
+    "" if re.search(r"if\s*\(\s*enabled\s*&&\s*self\s*\)", code) else
+    "连「关闭」也过问会干扰系统的状态机")
+
+chk("setEnabled hook 一定转发原实现",
+    re.search(r"gOrigSetEnabled\)\s*\{\s*\n\s*\(\(void \(\*\)\(id, SEL, BOOL\)\)gOrigSetEnabled\)",
+              code) is not None,
+    "" if "((void (*)(id, SEL, BOOL))gOrigSetEnabled)" in code else
+    "不转发 orig → enabled 永远改不动 → 手势状态错乱")
+
+chk("硬判定只认 Camera / HorizontalScrollFailure 两类",
+    # ★ 每多认一类，就多一份误伤面。这两条都是语义明确的：
+    #   Camera 不用说；HorizontalScrollFailure 是锁屏相机的标准实现
+    #   （横向滚不动 → 交给相机）。
+    re.search(r'strstr\(n,\s*"Camera"\)', src) is not None
+    and re.search(r'strstr\(n,\s*"HorizontalScrollFailure"\)', src) is not None,
+    "" if re.search(r'strstr\(n,\s*"HorizontalScrollFailure"\)', src) else
+    "缺少 HorizontalScrollFailure → 拦不住锁屏相机入口")
+
+chk("候选类只记录、不拦截",
+    # ★ _UIPendingEdgeSwipe / UIImmediateEdgeSwipe 是 UIKit 的边缘手势仲裁器，
+    #   拦它们会破坏仲裁，可能让别的边缘手势失灵。
+    #   本版对它们只记录 enable 时机，用来在日志里确认职责。
+    re.search(r"NLWDiagNoteEnable\(n,\s*NO\);", code) is not None,
+    "" if "NLWDiagNoteEnable(n, NO);" in code else
+    "候选类被一起拦了 → 边缘手势仲裁可能失效")
+
+chk("压制循环里对相机入口类做了即时压制（hook 管将来，这里管现在）",
+    # ★ 双保险：setEnabled hook 只能拦住「将来」的启用；
+    #   如果抓到这个手势时它已经被启用过，hook 不会补一次。
+    #   循环里这道判断负责把「当前已是 YES」的情况立刻压掉。
+    re.search(r"if\s*\(gBlockCameraSwipe\s*&&\s*\n\s*NLWIsCameraEntryGestureClass\(", code)
+    is not None,
+    "" if "NLWIsCameraEntryGestureClass(\n" in code else
+    "只有 setEnabled hook，抓到时已启用的那次压不到")
 
 # =====================================================================
 print("\n[A7] 热路径零 IO（watchdog 会杀进程）")
