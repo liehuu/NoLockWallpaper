@@ -383,6 +383,16 @@ MKDEB_CASES = [
         "for _ic in icon@2x.png icon@3x.png; do",
         "三个尺寸图标一起打包",
     ),
+    (
+        # ★ 真实事故原样复现（1.1-1）：postinst 里 sbreload 打断 dpkg 事务
+        #   → 锁残留 + 半装 → Sileo 报「dpkg 被中断，无法安装 deb」
+        # 锚点用 printf 行，不用含反斜杠转义的整行，避免用例因转义写法差异而 SKIP
+        "postinst 里重启桌面（打断 dpkg 事务 → 锁残留，之后所有 deb 装不上）",
+        "printf '再重启桌面，插件将完全不再动手。删掉该文件即恢复。",
+        "if [ -x /usr/bin/sbreload ]; then /usr/bin/sbreload >/dev/null 2>&1 || true; fi\n"
+        "printf '再重启桌面，插件将完全不再动手。删掉该文件即恢复。",
+        "postinst 里不重启桌面",
+    ),
 ]
 
 
@@ -395,6 +405,15 @@ CHECKDEB_CASES = [
         'b"UIScreenEdgePanGestureRecognizer", b"edges",\n'
         '                       b"UIRectEdgeRight"):',
         "check_deb.py 不用枚举常量做产物指纹",
+    ),
+    (
+        # ★ 1.1-1 事故的第二道防线：产物侧对维保脚本的硬判据。
+        #   删掉 _MNT_BAD 后，check_deb.py 就再也发现不了 postinst 里的 sbreload
+        #   → 坏包会一路绿灯进交付目录。
+        "删掉产物侧「维保脚本不重启桌面」判据（坏包能过生产校验）",
+        "_MNT_BAD = (",
+        "_MNT_BAD_UNUSED = (",
+        "check_deb.py 校验维保脚本不重启桌面",
     ),
 ]
 

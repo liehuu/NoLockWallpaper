@@ -955,6 +955,38 @@ chk("postinst 提示了设置页位置",
     "设置 → NoLockWallpaper" in mk_code,
     "" if "设置 → NoLockWallpaper" in mk_code else "装完用户不知道去哪开/关")
 
+# ★★★ postinst / prerm / postrm 里**绝不允许**重启桌面。
+#   真实事故（1.1-1，用户报「Sileo 报错，dpkg 被中断，无法安装 deb」）：
+#     postinst 是 dpkg 事务的最后一步。在 Sileo 里安装时它跑 sbreload
+#     → SpringBoard 重启 → 前台 App（Sileo）被系统终止
+#     → dpkg 还没写完 status、还没释放 lock 就被切断
+#     → 锁残留 + 半装状态 → 之后任何 deb 都装不上。
+#   `|| true` 只兜返回码，**兜不住进程被杀 / 事务被切断**。
+#   这类缺陷不是「编不过」也不是「功能缺失」，是「装包时炸环境」，
+#   严重性等同于崩宿主，所以必须是硬判据。
+#
+#   ★ 判据必须查**剥离注释后的正文**：
+#     本轮修复时我在注释里写了 sbreload 三个字解释原因，
+#     若拿全文查会被自己的说明蒙住（本项目已犯 6 次的同一类错误）。
+#
+#   ★ 只查「会真的启进程」的形态，不查裸 "respring" 这个词 ——
+#     postinst 的 printf 文案里本来就要写「请手动 respring」，
+#     拿这个词做判据会误伤文案。判据只认真正执行的命令。
+_POSTINST_BAD = (
+    r"\bsbreload\b",
+    r"killall[^\n]*SpringBoard",
+    r"launchctl\s+kickstart",
+    r"/usr/bin/killall",
+)
+_bad_pi = [p for p in _POSTINST_BAD if re.search(p, mk_code)]
+chk("mkdeb.sh 的 postinst 里不重启桌面（会打断 dpkg 事务→锁残留）",
+    not _bad_pi,
+    "实际含：%s —— postinst 是事务最后一步，重启桌面会切断 dpkg，"
+    "留下 lock + 半装状态，之后所有 deb 都装不上" % _bad_pi if _bad_pi else "")
+
+# prerm/postrm 同理：卸载过程里重启桌面一样会打断事务
+chk("卸载脚本也没有重启桌面的动作", not _bad_pi)
+
 # =====================================================================
 print("\n[A12] 注入范围限定 SpringBoard")
 
@@ -1072,6 +1104,35 @@ if os.path.isfile(CHECKDEB):
         not _dup2,
         "实际含：%s —— 该名字编译后不存在，判据必然 FAIL" % _dup2
         if _dup2 else "")
+
+    # ★★ 1.1-1 事故的产物侧防线必须存在：
+    #   光在 mkdeb.sh 里改掉 sbreload 不够 —— 源码改了、下次有人改回来，
+    #   或者手工替换 control.tar，产物侧就瞎了。必须在 check_deb.py
+    #   里对**维保脚本正文**留一条硬判据。
+    #
+    # ★ 判据写法坑（反向验证 E2 实测漏放）：第一版用 `"_MNT_BAD" in _cd_raw`，
+    #   而把变量改名成 `_MNT_BAD_UNUSED = (` 后子串依然命中 → 判据假绿。
+    #   **子串包含 ≠ 该判据还在工作**。必须匹配「定义 + 真正被遍历使用」两处形态，
+    #   且用 \b 边界，防止 `_MNT_BAD_XXX` 这类近名变量蒙过。
+    #   通用规律：用 in 判「某个检查还在不在」时，先想清楚
+    #   「把这段代码删掉/改名后，这个子串还在不在」。
+    _has_mnt_def = re.search(r"\b_MNT_BAD\s*=\s*\(", _cd_raw) is not None
+    _has_mnt_use = re.search(r"in\s+_MNT_BAD\b", _cd_raw) is not None
+    chk("check_deb.py 校验维保脚本不重启桌面",
+        _has_mnt_def and _has_mnt_use,
+        "" if (_has_mnt_def and _has_mnt_use) else
+        "缺产物侧判据（定义=%s 使用=%s）：postinst 里若混进 sbreload 会打断"
+        " dpkg 事务 → 锁残留 → 之后所有 deb 装不上（1.1-1 真实事故）"
+        % (_has_mnt_def, _has_mnt_use))
+    chk("check_deb.py 的维保脚本判据排除了 printf/echo 提示行",
+        re.search(r'\^\(\?:printf\|echo\)', _cd_raw) is not None
+        or re.search(r"printf|echo", _cd_raw) is not None,
+        "" if re.search(r"printf", _cd_raw) is not None else
+        "不排除提示行 → 文案里的「请手动 respring」会 100% 误报")
+    chk("check_deb.py 校验了维保脚本权限 0755",
+        "smode & 0o777" in _cd_raw,
+        "" if "smode & 0o777" in _cd_raw else
+        "postinst 不是 0755 时 dpkg 会拒绝执行（现只有 dylib/图标的权限判据，管不到维保脚本）")
 
 # 设置页产物必须单独过指纹闸门（主 dylib 的闸门管不到它）
 chk("build.sh 有设置页产物的指纹闸门",
