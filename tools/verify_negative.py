@@ -270,6 +270,23 @@ PREF_CASES = [
         "设置页未调用 reloadSpecifier:nil",
     ),
     (
+        # ★ 本轮 CI 真实失败原样复现：ARC 下裸指针强转
+        "用 ARC 禁止的裸指针强转读 ivar（本轮 CI 真实失败原因）",
+        "    return nil;\n}\n\nstatic void NLWSetSpecifiers",
+        "    return *(NSArray **)((char *)(__bridge void *)self + 8);\n"
+        "}\n\nstatic void NLWSetSpecifiers",
+        "设置页未用 ARC 禁止的裸指针强转读 ivar",
+    ),
+    (
+        "退回 ivar_getOffset 手工指针算术（接着必然裸指针强转，ARC 编不过）",
+        "            iv = class_getInstanceVariable([PSListController class],\n"
+        "                                           \"_specifiers\");",
+        "            iv = class_getInstanceVariable([PSListController class],\n"
+        "                                           \"_specifiers\");\n"
+        "            (void)ivar_getOffset(iv);",
+        "设置页未用 ivar_getOffset 手工算指针",
+    ),
+    (
         "不实现 specifiers（用户看到整块空白）",
         "- (NSArray *)specifiers\n{",
         "- (NSArray *)specifiersDisabled\n{",
